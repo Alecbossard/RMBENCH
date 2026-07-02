@@ -17,6 +17,7 @@ import yaml
 from datetime import datetime
 import importlib
 import argparse
+import ast
 import pdb
 
 from generate_episode_instructions import *
@@ -81,6 +82,22 @@ def main(usr_args):
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
+
+    # RMBench task YAML is loaded after policy/SVLR/deploy_policy.yml, so task-level
+    # overrides such as --render_freq were previously lost here. Keep normal
+    # defaults from the task YAML, but let explicit CLI/policy overrides replace
+    # them before setup_demo(...) creates the SAPIEN viewer/env.
+    _TASK_LEVEL_OVERRIDES = {
+        "render_freq": int,
+        "save_freq": lambda v: None if str(v).lower() == "none" else int(v),
+        "eval_video_log": lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on"),
+        "clear_cache_freq": int,
+    }
+    for _key, _cast in _TASK_LEVEL_OVERRIDES.items():
+        if _key in usr_args and usr_args[_key] is not None:
+            args[_key] = _cast(usr_args[_key])
+
+    print(f"[SVLR eval] render_freq={args.get('render_freq')} eval_video_log={args.get('eval_video_log')}")
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -165,7 +182,9 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    # Use --episode_num when provided; otherwise respect the task config file.
+    # This avoids the previous hardcoded 100-episode debug trap.
+    test_num = int(usr_args.get("episode_num", args.get("episode_num", 1)))
     topk = 1
 
     model = get_model(usr_args)
@@ -176,7 +195,8 @@ def main(usr_args):
                                    st_seed,
                                    test_num=test_num,
                                    video_size=video_size,
-                                   instruction_type=instruction_type)
+                                   instruction_type=instruction_type,
+                                   global_task=usr_args.get("global_task"))
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -212,7 +232,8 @@ def eval_policy(task_name,
                 st_seed,
                 test_num=100,
                 video_size=None,
-                instruction_type=None):
+                instruction_type=None,
+                global_task=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -275,8 +296,12 @@ def eval_policy(task_name,
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if global_task is not None and str(global_task).strip():
+            instruction = str(global_task).strip()
+        else:
+            instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+        print(f"[SVLR eval] instruction: {instruction}")
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
@@ -367,15 +392,18 @@ def parse_args_and_config():
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    # Parse overrides
+    # Parse overrides as --key value pairs. Values use literal_eval when possible
+    # so numbers, booleans and lists work, while plain strings stay plain strings.
     def parse_override_pairs(pairs):
+        if len(pairs) % 2 != 0:
+            raise SystemExit(f"Overrides must be --key value pairs, got: {pairs}")
         override_dict = {}
         for i in range(0, len(pairs), 2):
             key = pairs[i].lstrip("--")
             value = pairs[i + 1]
             try:
-                value = eval(value)
-            except:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 pass
             override_dict[key] = value
         return override_dict

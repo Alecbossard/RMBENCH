@@ -3,7 +3,7 @@ Simulation web server — RoboTwin (SAPIEN) behind the robot_server.py HTTP API
 -----------------------------------------------------------------------------
 Exposes the same endpoints robot_server.py exposes, so SVLR's internal robot
 client talks to the RoboTwin simulation with no change. Adds an optional driver
-thread that calls SVLR's Gradio API (/process_llm_command) once per episode.
+thread that calls SVLR's Gradio API (/process_vlm, then /process_llm_command) once per episode.
 
 Topology
 --------
@@ -11,7 +11,7 @@ Topology
         │  serves cam/pose/actions on :65500  ◀── SVLR's robot client
     SVLR Gradio app (:7860)  ── the brain ──────┘
         ▲
-    driver thread (in this process) ── /process_llm_command(instruction) per episode
+    driver thread (in this process) ── /process_vlm + /process_llm_command(instruction) per episode
 
 Why there is no startup deadlock
 --------------------------------
@@ -135,23 +135,30 @@ EE_POS_TOL_M = 0.02          # measured-to-target EE distance (m) treated as "re
 EE_SETTLE_EPS_M = 0.002      # per-substep EE motion (m) below this -> "settled" (can't get closer)
 EE_HOLD_FRAMES = 3           # consecutive passing checks required before completing
 MAX_SUBSTEPS_PER_ACTION = 60  # hard cap on take_action calls per SVLR command (anti-deadlock)
+MIN_SUBSTEPS_PER_ACTION = 8   # minimum sim substeps before acknowledging one SVLR command
+FINISH_IDLE_S = 5.0          # auto-drive: after SVLR Gradio call returns and no actions arrive, end episode
 
 # --- Fixed "home"/ready pose driven on the first step of each episode, BEFORE
 # SVLR is invoked (the sim analogue of RealRobotBackend._move_to_initial_position).
 # Controlled-arm target: xyz(3) + quat(4, in QUAT_ORDER) + gripper(1).  ADAPT.
-HOME_ON_RESET = True
-HOME_CONTROLLED = np.array([0, -0.2,  1.25,  0.5, -0.5, 0.5, 0.5, 1.0], dtype=np.float64)
+HOME_ON_RESET = False
+HOME_CONTROLLED = np.array([0.0, -0.209626218, 0.985244835, 0.531253938, -0.466658865, 0.466639370, 0.531268722, 1.0], dtype=np.float64)
 
 
 def map_gripper(svlr_gripper: float) -> float:
-    """SVLR's gripper scalar -> RoboTwin endpose gripper convention. ADAPT.
+    """SVLR gripper scalar -> RoboTwin normalized gripper command.
 
-    Identity by default. If SVLR sends SO-100 units (e.g. ~1.6 rad) but RoboTwin's
-    endpose gripper channel is normalized [0,1] (or a width), convert here. This
-    affects the gripper COMMAND only; completion is gated on EE position, not the
-    gripper, so unit mismatches here won't stall the handshake.
+    SVLR/PANDA uses a physical opening width (open ~= 0.08, close = 0.0), while
+    RoboTwin/SAPIEN policies usually use a normalized command (open = 1.0, close = 0.0).
+    Keep already-normalized values untouched, and map small Panda-style widths to binary
+    open/close so pick/place actions do not run with an almost-closed gripper.
     """
-    return float(svlr_gripper)
+    value = float(svlr_gripper)
+    if not np.isfinite(value):
+        return 0.0
+    if 0.0 <= value <= 0.12:
+        return 1.0 if value >= 0.04 else 0.0
+    return float(np.clip(value, 0.0, 1.0))
 
 
 def _quat_wxyz_to_xyzw(q) -> list[float]:
@@ -183,10 +190,111 @@ def placeholder_camera_payload(w: int = PLACEHOLDER_W, h: int = PLACEHOLDER_H) -
             "timestamp_s": time.time(), "placeholder": True}
 
 
-def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY) -> dict[str, Any]:
-    """obs -> LocalCameraSource.read_payload shape. ADAPT navigation/keys.
-    Runs on the harness thread on a materialized obs (no env/SAPIEN call)."""
-    cam = obs["observation"][camera_key]
+def _select_camera(obs: Any, preferred_key: str = CAMERA_KEY) -> tuple[str, dict]:
+    """Return the requested camera when available, otherwise fall back safely.
+
+    RMBench/Franka works best with the wrist camera for this SVLR bridge, so the
+    default is right_camera. The fallback is only for configs that do not expose it.
+    """
+    observation = obs.get("observation", {}) if isinstance(obs, dict) else {}
+    preferred = [preferred_key, "right_camera", "left_camera", "head_camera", "front_camera"]
+    for key in preferred:
+        if key and key in observation:
+            cam = observation[key]
+            if isinstance(cam, dict) and "rgb" in cam:
+                return key, cam
+    available = list(observation.keys())
+    raise KeyError(f"No usable RGB camera found. preferred={preferred_key!r}, available={available}")
+
+
+def _normalise_depth_to_m(depth: Any) -> np.ndarray:
+    """Return RMBench depth in meters.
+
+    RMBench/RoboTwin get_depth() stores depth in millimeters. SVLR expects meters.
+    This auto-detect keeps the bridge safe if a future config already returns meters.
+    """
+    arr = np.asarray(depth, dtype=np.float32)
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[:, :, 0]
+    valid = arr[np.isfinite(arr) & (arr > 0)]
+    if valid.size and float(np.nanmedian(valid)) > 10.0:
+        arr = arr * 0.001
+    return arr.astype(np.float32, copy=False)
+
+
+def _camera_object_from_env(env: Any, camera_key: str):
+    """Return the live SAPIEN camera object for camera_key, if available.
+
+    This is called only on the RMBench main/eval thread, right after env.get_obs().
+    It is therefore safe to read SAPIEN camera textures here.
+    """
+    cams = getattr(env, "cameras", None)
+    if cams is None:
+        return None
+    if camera_key == "left_camera" and hasattr(cams, "left_camera"):
+        return cams.left_camera
+    if camera_key == "right_camera" and hasattr(cams, "right_camera"):
+        return cams.right_camera
+    for cam, name in zip(getattr(cams, "static_camera_list", []), getattr(cams, "static_camera_name", [])):
+        if name == camera_key:
+            return cam
+    return None
+
+
+def _world_xyz_from_camera_object(env: Any, camera_key: str, rgb_shape) -> np.ndarray | None:
+    """Dense per-pixel world XYZ from the selected RMBench/SAPIEN camera.
+
+    This is the clean simulation calibration path: instead of trying to reuse the
+    real Panda wrist-camera dx/dy/dz, the bridge asks SAPIEN for the rendered
+    per-pixel camera-space position texture and transforms it with the camera model
+    matrix. It works for wrist cameras too, because it is recomputed every frame.
+    """
+    camera = _camera_object_from_env(env, camera_key)
+    if camera is None:
+        return None
+    try:
+        position = np.asarray(camera.get_picture("Position"), dtype=np.float32)
+        model = np.asarray(camera.get_model_matrix(), dtype=np.float32)
+    except Exception as exc:
+        print(f"[sim-server] could not read world XYZ for {camera_key}: {exc}")
+        return None
+
+    if position.ndim != 3 or position.shape[-1] < 3:
+        return None
+
+    h, w = rgb_shape[:2]
+    if position.shape[0] != h or position.shape[1] != w:
+        print(
+            f"[sim-server] world XYZ shape mismatch for {camera_key}: "
+            f"position={position.shape[:2]}, rgb={(h, w)}"
+        )
+        return None
+
+    pts_cam = position[..., :3]
+    world = pts_cam @ model[:3, :3].T + model[:3, 3]
+
+    if position.shape[-1] >= 4:
+        valid = np.isfinite(position[..., :3]).all(axis=-1) & (position[..., 3] < 1.0)
+        world = world.astype(np.float32, copy=False)
+        world[~valid] = np.nan
+    return world.astype(np.float32, copy=False)
+
+
+def _npy_b64(array: np.ndarray) -> str:
+    buf = BytesIO()
+    np.save(buf, np.asarray(array, dtype=np.float32), allow_pickle=False)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY, env: Any | None = None) -> dict[str, Any]:
+    """Observation -> SVLR remote RGB-D payload.
+
+    Extra field for simulation calibration:
+      world_xyz_npy_b64: HxWx3 float32, per-pixel XYZ in RMBench/world frame.
+
+    SVLR uses that field when present. Real robot workflows ignore it.
+    """
+    used_camera_key, cam = _select_camera(obs, camera_key)
     rgb = np.asarray(cam["rgb"])
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
@@ -195,9 +303,13 @@ def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY) -> dict[str, 
     depth_b64 = None
     depth = cam.get("depth") if isinstance(cam, dict) else None
     if depth is not None:
-        buf = BytesIO()
-        np.save(buf, np.asarray(depth, dtype=np.float32))
-        depth_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        depth_m = _normalise_depth_to_m(depth)
+        depth_b64 = _npy_b64(depth_m)
+
+    world_xyz_b64 = None
+    world_xyz = _world_xyz_from_camera_object(env, used_camera_key, rgb.shape) if env is not None else None
+    if world_xyz is not None:
+        world_xyz_b64 = _npy_b64(world_xyz)
 
     h, w = rgb.shape[:2]
     intr = cam.get("intrinsic_cv") if isinstance(cam, dict) else None
@@ -208,10 +320,21 @@ def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY) -> dict[str, 
     else:
         intrinsics = _intrinsics(w, h)
 
-    return {"ok": True, "color_bgr_jpeg_b64": _jpeg_b64(bgr), "depth_npy_b64": depth_b64,
-            "intrinsics": intrinsics, "camera_name": str(camera_key),
-            "timestamp_s": time.time()}
-
+    payload = {
+        "ok": True,
+        "color_bgr_jpeg_b64": _jpeg_b64(bgr),
+        "depth_npy_b64": depth_b64,
+        "world_xyz_npy_b64": world_xyz_b64,
+        "intrinsics": intrinsics,
+        "camera_name": str(used_camera_key),
+        "timestamp_s": time.time(),
+    }
+    if isinstance(cam, dict):
+        if cam.get("cam2world_gl") is not None:
+            payload["cam2world_gl"] = np.asarray(cam["cam2world_gl"], dtype=float).tolist()
+        if cam.get("extrinsic_cv") is not None:
+            payload["extrinsic_cv"] = np.asarray(cam["extrinsic_cv"], dtype=float).tolist()
+    return payload
 
 def _entry_to_xyz_quat(pose: Any) -> tuple[np.ndarray, np.ndarray]:
     """One endpose entry (left_endpose / right_endpose) -> (xyz[3], quat[4]) with
@@ -285,19 +408,50 @@ def _endpose_from_obs(obs: Any) -> Optional[np.ndarray]:
     return None
 
 
+def svlr_action_has_position(svlr_action: dict) -> bool:
+    """True when an SVLR low-level command includes an EE target XYZ.
+
+    Gripper-only commands such as {"gripper": 0.0} must still be executed for
+    several SAPIEN substeps, but they should not invent or require a new target
+    position.
+    """
+    return (
+        "pos_end_effector" in svlr_action
+        or all(k in svlr_action for k in ("ee.x", "ee.y", "ee.z"))
+    )
+
+
 def build_take_action(svlr_action: dict, cmd: np.ndarray, arm: str = CONTROLLED_ARM) -> np.ndarray:
     base = _ARM_BASE[arm]
     out = cmd.copy()
     print("[sim-server] SVLR action:", svlr_action)
-    pos = svlr_action.get("pos_end_effector") or [svlr_action["ee.x"], svlr_action["ee.y"], svlr_action["ee.z"]]
-    out[base + 0:base + 3] = [float(pos[0]), float(pos[1]), float(pos[2])]
-    out[base + 3:base + 7] = FIXED_QUAT_WXYZ # [float(pos[3]), float(pos[4]), float(pos[5]), float(pos[6])] if len(pos) >= 7 else np.array(FIXED_QUAT_WXYZ, dtype=np.float64)
+
+    # SVLR low-level primitives may be gripper-only, e.g. {"gripper": 0.0}.
+    # Keep the previous EE target in that case; do not crash and do not invent XYZ.
+    if svlr_action_has_position(svlr_action):
+        pos = svlr_action.get("pos_end_effector")
+        if pos is None:
+            pos = [svlr_action["ee.x"], svlr_action["ee.y"], svlr_action["ee.z"]]
+
+        out[base + 0:base + 3] = [float(pos[0]), float(pos[1]), float(pos[2])]
+
+        # IMPORTANT for wrist-camera RMBench runs:
+        # The EE orientation is part of the camera view.  Do not force a generic
+        # quaternion here.  The RMBENCH SVLR profile emits the calibrated init
+        # quaternion for every waypoint, so movements and final go_init keep the
+        # wrist camera in the same useful view frame.
+        if len(pos) >= 7:
+            out[base + 3:base + 7] = [float(pos[3]), float(pos[4]), float(pos[5]), float(pos[6])]
+        else:
+            # Legacy fallback: preserve the previously commanded orientation.
+            out[base + 3:base + 7] = cmd[base + 3:base + 7]
+    else:
+        print("[sim-server] gripper-only action: keeping previous EE target pose")
+
     if "gripper" in svlr_action or "ee.gripper_pos" in svlr_action:
         raw = svlr_action.get("gripper", svlr_action.get("ee.gripper_pos"))
-        out[base + 7] = map_gripper(float(raw))  # SVLR units -> RoboTwin gripper units
-    # else: keep the previous gripper value already in `out`
+        out[base + 7] = map_gripper(float(raw))
     return out
-
 
 def requested_ee_xyz(cmd: np.ndarray, arm: str = CONTROLLED_ARM) -> np.ndarray:
     base = _ARM_BASE[arm]
@@ -408,6 +562,10 @@ class SimBridge:
         with self._lock:
             return name in self._entities
 
+    def action_count(self) -> int:
+        with self._lock:
+            return int(self._action_count)
+
     def status(self) -> dict:
         with self._lock:
             return {"action_count": self._action_count, "end_action": self._end_action,
@@ -476,19 +634,44 @@ def create_app(bridge: SimBridge) -> FastAPI:
 class SimServer:
     def __init__(self, host="0.0.0.0", port=65500, controlled_arm=CONTROLLED_ARM,
                  action_poll_s=0.1, drive=False, svlr_url="http://127.0.0.1:7860",
+                 camera_key=CAMERA_KEY, save_debug_images=False,
+                 call_vlm_before_llm=True,
                  ee_pos_tol_m=EE_POS_TOL_M, ee_settle_eps_m=EE_SETTLE_EPS_M,
                  ee_hold_frames=EE_HOLD_FRAMES,
                  max_substeps_per_action=MAX_SUBSTEPS_PER_ACTION,
+                 min_substeps_per_action=MIN_SUBSTEPS_PER_ACTION,
+                 finish_idle_s=FINISH_IDLE_S,
                  home_on_reset=HOME_ON_RESET, home_controlled=None) -> None:
         self.host, self.port = host, port
         self.controlled_arm = controlled_arm
-        self.action_poll_s = action_poll_s
+        self.action_poll_s = float(action_poll_s)
         self.drive, self.svlr_url = drive, svlr_url
+        self.camera_key = str(camera_key or CAMERA_KEY)
+        self.save_debug_images = bool(save_debug_images)
+        self.call_vlm_before_llm = bool(call_vlm_before_llm)
         self.ee_pos_tol_m = ee_pos_tol_m
         self.ee_settle_eps_m = ee_settle_eps_m
-        self.ee_hold_frames = ee_hold_frames
-        self.max_substeps_per_action = max_substeps_per_action
-        self.home_on_reset = home_on_reset
+        self.ee_hold_frames = int(ee_hold_frames)
+        self.max_substeps_per_action = int(max_substeps_per_action)
+        self.min_substeps_per_action = int(min_substeps_per_action)
+        self.finish_idle_s = float(finish_idle_s)
+        if self.finish_idle_s < 0.0:
+            raise ValueError("finish_idle_s must be >= 0")
+        self._driver_state_lock = threading.Lock()
+        self._driver_started = False
+        self._driver_finished = False
+        self._driver_failed = False
+        if self.max_substeps_per_action < 1:
+            raise ValueError("max_substeps_per_action must be >= 1")
+        if self.min_substeps_per_action < 1:
+            raise ValueError("min_substeps_per_action must be >= 1")
+        if self.min_substeps_per_action > self.max_substeps_per_action:
+            print(
+                f"[sim-server] min_substeps_per_action ({self.min_substeps_per_action}) "
+                f"> max_substeps_per_action ({self.max_substeps_per_action}); clamping to max"
+            )
+            self.min_substeps_per_action = self.max_substeps_per_action
+        self.home_on_reset = bool(home_on_reset)
         self.home_controlled = np.asarray(
             HOME_CONTROLLED if home_controlled is None else home_controlled, dtype=np.float64
         ).reshape(-1)
@@ -512,13 +695,29 @@ class SimServer:
         self._uv_thread.start()
         while not getattr(self._uv, "started", False):
             time.sleep(0.01)
-        print(f"[sim-server] http://{self.host}:{self.port}  (arm: {self.controlled_arm})  "
+        print(f"[sim-server] http://{self.host}:{self.port}  "
+              f"(arm: {self.controlled_arm}, camera: {self.camera_key})  "
               f"drive={'on->' + self.svlr_url if self.drive else 'off'}")
         if self.drive:
             self._driver_thread = threading.Thread(target=self._drive_loop, daemon=True)
             self._driver_thread.start()
 
-    # -- SVLR driver: retries connect, fires one /process_llm_command per episode --
+    def _mark_driver_started(self) -> None:
+        with self._driver_state_lock:
+            self._driver_started = True
+            self._driver_finished = False
+            self._driver_failed = False
+
+    def _mark_driver_finished(self, failed: bool = False) -> None:
+        with self._driver_state_lock:
+            self._driver_finished = True
+            self._driver_failed = bool(failed)
+
+    def _driver_done(self) -> tuple[bool, bool]:
+        with self._driver_state_lock:
+            return bool(self._driver_finished), bool(self._driver_failed)
+
+    # -- SVLR driver: retries connect, fires one /process_vlm + /process_llm_command per episode --
     def _drive_loop(self) -> None:
         try:
             from gradio_client import Client
@@ -540,70 +739,119 @@ class SimServer:
                 continue
             try:
                 # Blocks for the whole episode while SVLR drives :65500.
+                # SVLR requires perception to run before language/action generation.
+                if self.call_vlm_before_llm:
+                    print("[driver] running SVLR VLM perception")
+                    client.predict(api_name="/process_vlm")
+                print(f"[driver] running SVLR LLM command: {instruction}")
                 client.predict(prompt=instruction, api_name="/process_llm_command")
+                # The Gradio call returning means SVLR has generated its low-level
+                # queue. Execution may still be draining through /send_action, so
+                # do NOT stop immediately; step() will finish only after an idle
+                # grace period with no new actions.
+                self._mark_driver_finished(False)
             except Exception as e:
                 print(f"[driver] SVLR command failed: {e}")
+                self._mark_driver_finished(True)
                 client = None  # force reconnect next round
 
     # -- per-episode reset --
     def reset_episode(self) -> None:
         self._cmd = None
         self.bridge.begin_episode()
+        with self._driver_state_lock:
+            self._driver_started = False
+            self._driver_finished = False
+            self._driver_failed = False
+
+    def _save_debug_camera_images(self, obs: Any, suffix: str) -> None:
+        if not self.save_debug_images:
+            return
+        try:
+            observation = obs.get("observation", {}) if isinstance(obs, dict) else {}
+            saved_any = False
+            for key, cam in observation.items():
+                if not isinstance(cam, dict) or "rgb" not in cam:
+                    continue
+                rgb = np.asarray(cam["rgb"])
+                if rgb.dtype != np.uint8:
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                out_path = f"svlr_bridge_{key}_{suffix}.png"
+                Image.fromarray(rgb).save(out_path)
+                print(f"[sim-server] saved {out_path}")
+                saved_any = True
+            if not saved_any:
+                print(f"[sim-server] no RGB cameras found to save; keys={list(observation.keys())}")
+        except Exception as exc:
+            print(f"[sim-server] could not save debug camera images: {exc}")
 
     # -- one eval() == one step --
     def step(self, env: Any, observation: Any) -> None:
-        cam = env.get_obs()["observation"][CAMERA_KEY]
-        rgb = np.asarray(cam["rgb"])
-        img = Image.fromarray(rgb)
-        img.save(f"output_step{env.take_action_cnt}.png")
-        cam = env.get_obs()["observation"]["right_camera"]
-        rgb = np.asarray(cam["rgb"])
-        img = Image.fromarray(rgb)
-        img.save(f"output_right_step{env.take_action_cnt}.png")
-        print(f"[sim-server] save output_step{env.take_action_cnt}.png")
-        
+        self._save_debug_camera_images(observation, f"step{env.take_action_cnt}")
         print("[sim-server] end pose:", _endpose_from_obs(observation))
-        
-        
-        
+
         if self._cmd is None:
             # First step of the episode: home the arm BEFORE engaging SVLR, then
             # publish the homed frame and hand the instruction to the driver.
             self._home_and_engage(env, observation)
-            cam = env.get_obs()["observation"][CAMERA_KEY]
-            rgb = np.asarray(cam["rgb"])
-            img = Image.fromarray(rgb)
-            img.save(f"output_step_home{env.take_action_cnt}.png")
-            cam = env.get_obs()["observation"]["right_camera"]
-            rgb = np.asarray(cam["rgb"])
-            img = Image.fromarray(rgb)
-            img.save(f"output_right_step_home{env.take_action_cnt}.png")
-            print(f"[sim-server] save output_step_home{env.take_action_cnt}.png")
+            self._save_debug_camera_images(env.get_obs(), f"home{env.take_action_cnt}")
         else:
             measured = _endpose_from_obs(observation)
             pose = pose_for_svlr(measured if measured is not None else self._cmd, self.controlled_arm)
-            self.bridge.publish(pose, extract_camera_payload(observation), sim_list_entities(env))
+            self.bridge.publish(pose, extract_camera_payload(observation, self.camera_key, env=env), sim_list_entities(env))
 
         action = None
+        wait_started = time.monotonic()
+        last_wait_log = 0.0
         while not self.bridge.stop_requested:
             action = self.bridge.pop_action(timeout=self.action_poll_s)
             if action is not None:
                 break
-        if action is None:  # /stop -> end episode by forcing the harness loop's exit
+            now = time.monotonic()
+            driver_finished, driver_failed = self._driver_done()
+            if self.drive and driver_finished and self.bridge.action_count() > 0:
+                idle_s = now - wait_started
+                if idle_s >= self.finish_idle_s:
+                    print(
+                        f"[sim-server] SVLR driver finished and no new action arrived "
+                        f"for {idle_s:.1f}s; ending episode "
+                        f"(driver_failed={driver_failed}, actions={self.bridge.action_count()})"
+                    )
+                    self.bridge.set_done(bool(getattr(env, "eval_success", False)) and not driver_failed)
+                    with contextlib.suppress(Exception):
+                        env.take_action_cnt = env.step_lim
+                    return
+            if now - last_wait_log >= 10.0:
+                print(f"[sim-server] waiting for SVLR action... "
+                      f"({now - wait_started:.1f}s; POST /stop or Ctrl-C to end)")
+                last_wait_log = now
+        if action is None:
+            # Only an explicit /stop request ends the episode here.
+            print("[sim-server] stop requested; ending current episode")
+            self.bridge.set_done(False)
             with contextlib.suppress(Exception):
                 env.take_action_cnt = env.step_lim
             return
 
+        # From this point until _execute_until_ee_reached returns, /end_action must
+        # stay false. SVLR should only receive the next completion acknowledgement
+        # once RMBench/SAPIEN has physically advanced the command.
+        self.bridge.set_end_action(False)
+        has_position_target = svlr_action_has_position(action)
         self._cmd = build_take_action(action, self._cmd, self.controlled_arm)
-        run_for = self._execute_until_ee_reached(env)
-        print(f"[sim-server] take_action: {self._cmd}  (ran {run_for} substeps)")
+        run_for = self._execute_until_ee_reached(env, has_position_target=has_position_target)
+        with contextlib.suppress(Exception):
+            self._save_debug_camera_images(env.get_obs(), f"after{env.take_action_cnt}")
+        print(f"[sim-server] take_action complete: {self._cmd}  (ran {run_for} substeps)")
+
+        # ACK the low-level SVLR command only after the sim has advanced it.
         self.bridge.set_end_action(True)
 
         if bool(getattr(env, "eval_success", False)):
             self.bridge.set_done(True)
             with contextlib.suppress(Exception):
                 self.bridge.publish(pose_for_svlr(self._cmd, self.controlled_arm),
-                                    extract_camera_payload(env.get_obs()), sim_list_entities(env))
+                                    extract_camera_payload(env.get_obs(), self.camera_key, env=env), sim_list_entities(env))
                 self.bridge.set_end_action(True)
 
     # -- first step: drive to the fixed home pose, then publish + engage SVLR --
@@ -623,63 +871,66 @@ class SimServer:
         pub_obs = env.get_obs()
         m = _endpose_from_obs(pub_obs)
         pose = pose_for_svlr(m if m is not None else self._cmd, self.controlled_arm)
-        self.bridge.publish(pose, extract_camera_payload(pub_obs), sim_list_entities(env))
+        self.bridge.publish(pose, extract_camera_payload(pub_obs, self.camera_key, env=env), sim_list_entities(env))
         self.bridge.set_end_action(True)
 
         with contextlib.suppress(Exception):
             instr = env.get_instruction()
             self.bridge.set_instruction(instr)
             if self.drive:
-                self._episode_q.put(instr)   # driver fires /process_llm_command now
+                self._mark_driver_started()
+                self._episode_q.put(instr)   # driver fires /process_vlm + /process_llm_command now
 
-    # -- step the sim until the EE position has reached the requested target --
-    def _execute_until_ee_reached(self, env: Any) -> None:
-        """Re-issue the current target until the measured EE position is within
-        ee_pos_tol_m of the requested XYZ (or the arm stops moving, or caps are
-        hit). Only after this returns will the next step flip end_action True, so
-        SVLR never sees completion before the end-effector is roughly in place.
+    # -- execute exactly one RMBench dense action per SVLR low-level command --
+    def _execute_until_ee_reached(self, env: Any, has_position_target: bool = True) -> int:
+        """Execute one SVLR low-level command as one RMBench dense action.
 
-        Completion = EE within tol of target, OR EE stopped moving (can't get
-        closer — IK/contact limit), held for ee_hold_frames checks. Falls back to
-        max_substeps_per_action / step_lim to guarantee termination.
+        Important RMBench/SAPIEN detail: env.take_action(..., action_type="ee")
+        is already a dense execution. It calls the internal planner and runs the
+        resulting joint/gripper trajectory through many simulator physics steps.
+
+        The previous bridge repeatedly re-issued the same EE target until the
+        measured EE error was below a tolerance. That made the arm look like it
+        was correcting/replanning in a loop, especially near contacts such as a
+        button press where the exact requested pose may be physically blocked.
+
+        New contract:
+          - one SVLR /send_action  ->  one env.take_action(..., "ee")
+          - publish the fresh observation
+          - acknowledge /end_action immediately after that dense execution returns
+
+        EE error is kept only as debug information; it no longer decides whether
+        to replay the same command.
         """
         target = requested_ee_xyz(self._cmd, self.controlled_arm)
-        step_lim = getattr(env, "step_lim", None)
-        prev = None
-        hold = 0
 
-        for iter in range(self.max_substeps_per_action):
-            # print(f"[sim-server] take_action: {self._cmd}")
-            env.take_action(self._cmd, action_type="ee")
-            
-            observation = env.get_obs()
-            measured = _endpose_from_obs(observation)
-            pose = pose_for_svlr(measured if measured is not None else self._cmd, self.controlled_arm)
-            self.bridge.publish(pose, extract_camera_payload(observation), sim_list_entities(env))
+        # One RMBench dense action. This may internally execute many physics
+        # steps, but the bridge should not re-send the same target again.
+        env.take_action(self._cmd, action_type="ee")
 
-            meas = measured_ee_xyz(env.get_obs(), self.controlled_arm)
-            # print("[sim-server] measured EE xyz:", meas, "target:", target)
+        observation = env.get_obs()
+        measured = _endpose_from_obs(observation)
+        pose = pose_for_svlr(measured if measured is not None else self._cmd, self.controlled_arm)
+        self.bridge.publish(
+            pose,
+            extract_camera_payload(observation, self.camera_key, env=env),
+            sim_list_entities(env),
+        )
+
+        if has_position_target:
+            meas = measured_ee_xyz(observation, self.controlled_arm)
             if meas is None:
-                return iter  # EE not observable -> cannot gate on it; complete now
-
-            dist = float(np.linalg.norm(meas - target))
-            moved = None if prev is None else float(np.linalg.norm(meas - prev))
-            prev = meas
-
-            reached = dist <= self.ee_pos_tol_m
-            settled = moved is not None and moved <= self.ee_settle_eps_m
-
-            if reached or settled:
-                hold += 1
-                if hold >= self.ee_hold_frames:
-                    return iter
+                print("[sim-server] one-shot position action complete; EE pose unavailable")
             else:
-                hold = 0
+                dist = float(np.linalg.norm(meas - target))
+                print(
+                    f"[sim-server] one-shot position action complete: "
+                    f"ee_error={dist:.4f}m (debug only)"
+                )
+        else:
+            print("[sim-server] one-shot gripper action complete")
 
-            if bool(getattr(env, "eval_success", False)):
-                return iter
-            if step_lim is not None and getattr(env, "take_action_cnt", 0) >= step_lim:
-                return iter
+        return 1
 
 
 # ===========================================================================
@@ -721,9 +972,18 @@ def get_model(usr_args=None):
             controlled_arm=_cfg(usr_args, "sim_arm", "SIM_ARM", CONTROLLED_ARM, str),
             drive=_cfg(usr_args, "sim_drive", "SIM_DRIVE", True, _as_bool),
             svlr_url=_cfg(usr_args, "svlr_url", "SVLR_URL", "http://127.0.0.1:7860", str),
+            camera_key=_cfg(usr_args, "sim_camera_key", "SIM_CAMERA_KEY", CAMERA_KEY, str),
+            save_debug_images=_cfg(usr_args, "sim_save_debug_images", "SIM_SAVE_DEBUG_IMAGES", False, _as_bool),
+            call_vlm_before_llm=_cfg(usr_args, "sim_call_vlm", "SIM_CALL_VLM", True, _as_bool),
             ee_pos_tol_m=_cfg(usr_args, "sim_ee_pos_tol", "SIM_EE_POS_TOL", EE_POS_TOL_M, float),
+            ee_settle_eps_m=_cfg(usr_args, "sim_ee_settle_eps", "SIM_EE_SETTLE_EPS", EE_SETTLE_EPS_M, float),
+            ee_hold_frames=_cfg(usr_args, "sim_ee_hold_frames", "SIM_EE_HOLD_FRAMES", EE_HOLD_FRAMES, int),
             max_substeps_per_action=_cfg(usr_args, "sim_max_substeps", "SIM_MAX_SUBSTEPS",
                                          MAX_SUBSTEPS_PER_ACTION, int),
+            min_substeps_per_action=_cfg(usr_args, "sim_min_substeps", "SIM_MIN_SUBSTEPS",
+                                         MIN_SUBSTEPS_PER_ACTION, int),
+            finish_idle_s=_cfg(usr_args, "sim_finish_idle_s", "SIM_FINISH_IDLE_S",
+                               FINISH_IDLE_S, float),
             home_on_reset=_cfg(usr_args, "sim_home", "SIM_HOME", HOME_ON_RESET, _as_bool),
             home_controlled=home_controlled,
         )
@@ -777,8 +1037,8 @@ class MockSimEnv:
 
     def get_obs(self):
         t = self.take_action_cnt
-        x = np.linspace(0, 255, self.w, dtype=np.uint8)
-        row = (x + t * 3) % 256
+        x = np.linspace(0, 255, self.w, dtype=np.uint16)
+        row = ((x + t * 3) % 256).astype(np.uint8)
         rgb = np.stack([np.tile(row, (self.h, 1)), np.tile(row[::-1], (self.h, 1)),
                         np.full((self.h, self.w), (t * 5) % 256, np.uint8)], axis=-1).astype(np.uint8)
         return {"observation": {CAMERA_KEY: {"rgb": rgb, "depth": np.full((self.h, self.w), 0.8, np.float32)}},
@@ -809,6 +1069,8 @@ def parse_args():
     p.add_argument("--mock", action="store_true", help="run the mock env (no SAPIEN)")
     p.add_argument("--drive", action="store_true", help="auto-drive a running SVLR Gradio app")
     p.add_argument("--svlr-url", default="http://127.0.0.1:7860")
+    p.add_argument("--camera-key", default=CAMERA_KEY)
+    p.add_argument("--save-debug-images", action="store_true")
     return p.parse_args()
 
 
@@ -819,7 +1081,9 @@ def main():
                          "module for real RoboTwin. Re-run with --mock to smoke-test.")
     global _SERVER
     _SERVER = SimServer(host=args.host, port=args.port, controlled_arm=args.arm,
-                        drive=args.drive, svlr_url=args.svlr_url)
+                        drive=args.drive, svlr_url=args.svlr_url,
+                        camera_key=args.camera_key,
+                        save_debug_images=args.save_debug_images)
     _SERVER.start()
     try:
         _run_mock_harness(_SERVER)

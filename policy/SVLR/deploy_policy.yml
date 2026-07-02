@@ -1,10 +1,28 @@
-# Basic experiment configuration (keep unchanged)
+# Basic experiment configuration
 policy_name: SVLR
-task_name: null
-task_config: null
-ckpt_setting: null
+task_name: press_button
+task_config: demo_clean_franka
+ckpt_setting: svlr_debug
 seed: 0
 instruction_type: unseen
 global_task: null
+episode_num: 1
 
-# Add Parameters You Need
+# SVLR bridge configuration
+# Start SVLR with: python main.py --robot_name RMBENCH --http_server 127.0.0.1 --port 65500 --disable-startup-init-pose
+svlr_url: http://127.0.0.1:7860
+sim_host: 0.0.0.0
+sim_port: 65500
+sim_arm: right
+sim_drive: true
+sim_camera_key: right_camera
+sim_call_vlm: true
+sim_save_debug_images: true
+
+# Motion/completion tuning
+sim_home: false
+sim_ee_pos_tol: 0.02
+sim_ee_settle_eps: 0.002
+sim_ee_hold_frames: 3
+sim_max_substeps: 60
+sim_min_substeps: 8
