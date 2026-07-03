@@ -32,11 +32,12 @@ Per-step policy contract (from eval_policy)
 One eval() step:
     publish harness frame + measured pose  ->  set end_action True (sim ready)
     ->  block until SVLR POSTs /send_action  ->  drive TASK_ENV.take_action(...,"ee")
-    repeatedly until the EE POSITION reaches the requested XYZ, then return.
-Because send_action sets end_action False and it only flips True again at the NEXT
-step's publish (after step() returns), SVLR cannot observe completion until the
-end-effector is roughly in place. Publishing before flipping end_action also keeps
-SVLR from ever reading a stale frame.
+    exactly once, then publish the fresh observation and acknowledge completion.
+
+This is a demo bridge, not the final benchmark policy. RMBench take_action() is
+already a dense motion primitive; re-sending the same target in a tolerance loop
+made contact actions such as press unstable. The bridge also exits cleanly if the
+SVLR Gradio driver finishes without producing any action.
 
 Threading: eval()/reset_model() run on the harness MAIN thread (all env access
 stays there); uvicorn + the SVLR driver run on background daemon threads; HTTP
@@ -142,7 +143,7 @@ FINISH_IDLE_S = 5.0          # auto-drive: after SVLR Gradio call returns and no
 # SVLR is invoked (the sim analogue of RealRobotBackend._move_to_initial_position).
 # Controlled-arm target: xyz(3) + quat(4, in QUAT_ORDER) + gripper(1).  ADAPT.
 HOME_ON_RESET = False
-HOME_CONTROLLED = np.array([0.0, -0.209626218, 0.985244835, 0.531253938, -0.466658865, 0.466639370, 0.531268722, 1.0], dtype=np.float64)
+HOME_CONTROLLED = np.array([0, -0.2,  1.25,  0.5, -0.5, 0.5, 0.5, 1.0], dtype=np.float64)
 
 
 def map_gripper(svlr_gripper: float) -> float:
@@ -672,8 +673,13 @@ class SimServer:
             )
             self.min_substeps_per_action = self.max_substeps_per_action
         self.home_on_reset = bool(home_on_reset)
+
+        # HOME_CONTROLLED is the observation/start pose for the single arm
+        # controlled by SVLR. It is the pose we move to when --sim_home true
+        # and no explicit --sim_home_controlled override is provided.
         self.home_controlled = np.asarray(
-            HOME_CONTROLLED if home_controlled is None else home_controlled, dtype=np.float64
+            HOME_CONTROLLED if home_controlled is None else home_controlled,
+            dtype=np.float64,
         ).reshape(-1)
         assert self.home_controlled.size == 8, "home_controlled must be xyz(3)+quat(4)+gripper(1)"
         self.bridge = SimBridge()
@@ -785,6 +791,28 @@ class SimServer:
         except Exception as exc:
             print(f"[sim-server] could not save debug camera images: {exc}")
 
+    def _pump_idle_viewer(self, env: Any, fps: float = 30.0) -> None:
+        """Keep the SAPIEN viewer interactive while waiting for SVLR/curl actions.
+
+        Important: this does NOT call env.take_action() and does NOT advance a
+        robot command. It only refreshes renderer/viewer events so the user can
+        move the SAPIEN UI camera while the bridge is idle.
+        """
+        if not getattr(env, "render_freq", 0):
+            return
+        viewer = getattr(env, "viewer", None)
+        if viewer is None:
+            return
+        try:
+            if hasattr(env, "_update_render"):
+                env._update_render()
+            elif hasattr(env, "scene"):
+                env.scene.update_render()
+            viewer.render()
+        except Exception as exc:
+            # Do not kill the episode just because the debug viewer had an issue.
+            print(f"[sim-server] idle viewer render warning: {exc}")
+
     # -- one eval() == one step --
     def step(self, env: Any, observation: Any) -> None:
         self._save_debug_camera_images(observation, f"step{env.take_action_cnt}")
@@ -803,21 +831,49 @@ class SimServer:
         action = None
         wait_started = time.monotonic()
         last_wait_log = 0.0
+
+        # Keep SAPIEN viewer responsive while waiting for SVLR/curl.
+        # action_poll_s=0.1 gives only ~10 Hz max, so use a shorter queue timeout
+        # during idle. Override with SIM_IDLE_RENDER_FPS=60 if needed.
+        try:
+            idle_render_fps = float(os.environ.get("SIM_IDLE_RENDER_FPS", "30"))
+        except Exception:
+            idle_render_fps = 30.0
+        idle_render_fps = max(1.0, min(120.0, idle_render_fps))
+        idle_render_dt = 1.0 / idle_render_fps
+        poll_timeout = min(float(self.action_poll_s), idle_render_dt)
+        last_idle_render = 0.0
+
         while not self.bridge.stop_requested:
-            action = self.bridge.pop_action(timeout=self.action_poll_s)
+            action = self.bridge.pop_action(timeout=poll_timeout)
             if action is not None:
                 break
             now = time.monotonic()
+            if now - last_idle_render >= idle_render_dt:
+                self._pump_idle_viewer(env, fps=idle_render_fps)
+                last_idle_render = now
             driver_finished, driver_failed = self._driver_done()
-            if self.drive and driver_finished and self.bridge.action_count() > 0:
+            if self.drive and driver_finished:
                 idle_s = now - wait_started
                 if idle_s >= self.finish_idle_s:
-                    print(
-                        f"[sim-server] SVLR driver finished and no new action arrived "
-                        f"for {idle_s:.1f}s; ending episode "
-                        f"(driver_failed={driver_failed}, actions={self.bridge.action_count()})"
+                    actions_seen = self.bridge.action_count()
+                    if actions_seen == 0:
+                        print(
+                            f"[sim-server] SVLR driver finished but produced no action "
+                            f"after {idle_s:.1f}s; ending episode "
+                            f"(driver_failed={driver_failed})"
+                        )
+                    else:
+                        print(
+                            f"[sim-server] SVLR driver finished and no new action arrived "
+                            f"for {idle_s:.1f}s; ending episode "
+                            f"(driver_failed={driver_failed}, actions={actions_seen})"
+                        )
+                    self.bridge.set_done(
+                        bool(getattr(env, "eval_success", False))
+                        and not driver_failed
+                        and actions_seen > 0
                     )
-                    self.bridge.set_done(bool(getattr(env, "eval_success", False)) and not driver_failed)
                     with contextlib.suppress(Exception):
                         env.take_action_cnt = env.step_lim
                     return

@@ -63,7 +63,7 @@ class Base_Task(gym.Env):
         self.task_name = kwags.get("task_name")
         self.save_dir = kwags.get("save_path", "data")
         self.ep_num = kwags.get("now_ep_num", 0)
-        self.render_freq = kwags.get("render_freq", 10)
+        self.render_freq = kwags.get("render_freq", 60)
         self.data_type = kwags.get("data_type", None)
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", False)
@@ -217,10 +217,15 @@ class Base_Task(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # SVLR demo patch:
+        # Disable SAPIEN ray tracing + OIDN denoiser.
+        # On some NVIDIA/Vulkan setups OIDN crashes with:
+        #   [svulkan2] [error] OIDN Error: CUTLASS error
+        # RGB-D cameras still work with the default raster renderer.
+        # sapien.render.set_camera_shader_dir("rt")
+        # sapien.render.set_ray_tracing_samples_per_pixel(32)
+        # sapien.render.set_ray_tracing_path_depth(8)
+        # sapien.render.set_ray_tracing_denoiser("oidn")
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -1711,6 +1716,12 @@ class Base_Task(gym.Env):
 
             self.scene.step()
             self._update_render()
+
+            # SVLR/debug patch:
+            # Keep the SAPIEN viewer rendering during dense env.take_action(...)
+            # so EE motions are visible instead of appearing as a teleport.
+            if self.render_freq:
+                self.viewer.render()
                 
             if self.check_success():
                 self.eval_success = True

@@ -9,7 +9,8 @@ global_task: null
 episode_num: 1
 
 # SVLR bridge configuration
-# Start SVLR with: python main.py --robot_name RMBENCH --http_server 127.0.0.1 --port 65500 --disable-startup-init-pose
+# Start SVLR first with: bash run_svlr_rmbench.sh
+# Run RMBench with: bash policy/SVLR/run_demo.sh
 svlr_url: http://127.0.0.1:7860
 sim_host: 0.0.0.0
 sim_port: 65500
@@ -18,6 +19,7 @@ sim_drive: true
 sim_camera_key: right_camera
 sim_call_vlm: true
 sim_save_debug_images: true
+sim_finish_idle_s: 5.0
 
 # Motion/completion tuning
 sim_home: false
