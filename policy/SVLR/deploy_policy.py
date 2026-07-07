@@ -127,16 +127,17 @@ DEFAULT_ENDPOSE = np.array(
      -2.44753662e-06, -2.09625375e-01,  1.23524601e+00,  5.31254846e-01, -4.66658013e-01,  4.66638342e-01,  5.31269465e-01, 1.00000000e+00], dtype=np.float64,
 )
 
-# --- Completion gating: end_action only after the EE POSITION reaches its target ---
-# A single take_action may not have driven the end-effector all the way to the
-# commanded XYZ yet, so step() keeps stepping (re-issuing the same target) until
-# the measured EE position is within EE_POS_TOL_M of the requested one. This
-# mirrors RealRobotBackend's completion check (COMPLETION_THRESHOLD_M / HOLD).
-EE_POS_TOL_M = 0.02          # measured-to-target EE distance (m) treated as "reached" (~20 mm)
-EE_SETTLE_EPS_M = 0.002      # per-substep EE motion (m) below this -> "settled" (can't get closer)
-EE_HOLD_FRAMES = 3           # consecutive passing checks required before completing
-MAX_SUBSTEPS_PER_ACTION = 60  # hard cap on take_action calls per SVLR command (anti-deadlock)
-MIN_SUBSTEPS_PER_ACTION = 8   # minimum sim substeps before acknowledging one SVLR command
+# --- Completion acknowledgement ---
+# RMBench env.take_action(..., action_type="ee") is already a dense planner +
+# simulator execution. The bridge therefore ACKs a low-level SVLR command after
+# one successful dense take_action call, and logs measured EE error for debug.
+# The tolerance/substep knobs are kept as accepted config/env fields for older
+# launcher compatibility, but they no longer decide whether to replay a command.
+EE_POS_TOL_M = 0.02
+EE_SETTLE_EPS_M = 0.002
+EE_HOLD_FRAMES = 3
+MAX_SUBSTEPS_PER_ACTION = 60
+MIN_SUBSTEPS_PER_ACTION = 8
 FINISH_IDLE_S = 5.0          # auto-drive: after SVLR Gradio call returns and no actions arrive, end episode
 
 # --- Fixed "home"/ready pose driven on the first step of each episode, BEFORE
@@ -242,6 +243,40 @@ def _camera_object_from_env(env: Any, camera_key: str):
     return None
 
 
+def _position_texture_from_camera(camera):
+    try:
+        position = np.asarray(camera.get_picture("Position"), dtype=np.float32)
+        units = "m"
+        valid = position[..., 3] < 1.0 if position.ndim == 3 and position.shape[-1] >= 4 else None
+    except Exception:
+        try:
+            position = np.asarray(camera.get_picture("PositionSegmentation"), dtype=np.float32)
+            units = "mm"
+            valid = (
+                np.linalg.norm(position[..., :3], axis=-1) > 0.0
+                if position.ndim == 3 and position.shape[-1] >= 3
+                else None
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                'SAPIEN camera did not provide "Position" or "PositionSegmentation".'
+            ) from exc
+
+    if position.ndim != 3 or position.shape[-1] < 3:
+        raise RuntimeError(f"Unexpected SAPIEN position texture shape: {position.shape}")
+
+    xyz = position[..., :3].astype(np.float32, copy=False)
+    finite = np.isfinite(xyz).all(axis=-1)
+    if units == "mm":
+        xyz = xyz * 0.001
+    else:
+        finite_values = np.abs(xyz[np.isfinite(xyz)])
+        if finite_values.size and float(np.nanmedian(finite_values)) > 10.0:
+            xyz = xyz * 0.001
+    valid = finite if valid is None else (valid & finite)
+    return xyz, valid
+
+
 def _world_xyz_from_camera_object(env: Any, camera_key: str, rgb_shape) -> np.ndarray | None:
     """Dense per-pixel world XYZ from the selected RMBench/SAPIEN camera.
 
@@ -254,29 +289,23 @@ def _world_xyz_from_camera_object(env: Any, camera_key: str, rgb_shape) -> np.nd
     if camera is None:
         return None
     try:
-        position = np.asarray(camera.get_picture("Position"), dtype=np.float32)
+        pts_cam, valid = _position_texture_from_camera(camera)
         model = np.asarray(camera.get_model_matrix(), dtype=np.float32)
     except Exception as exc:
         print(f"[sim-server] could not read world XYZ for {camera_key}: {exc}")
         return None
 
-    if position.ndim != 3 or position.shape[-1] < 3:
-        return None
-
     h, w = rgb_shape[:2]
-    if position.shape[0] != h or position.shape[1] != w:
+    if pts_cam.shape[0] != h or pts_cam.shape[1] != w:
         print(
             f"[sim-server] world XYZ shape mismatch for {camera_key}: "
-            f"position={position.shape[:2]}, rgb={(h, w)}"
+            f"position={pts_cam.shape[:2]}, rgb={(h, w)}"
         )
         return None
 
-    pts_cam = position[..., :3]
     world = pts_cam @ model[:3, :3].T + model[:3, 3]
-
-    if position.shape[-1] >= 4:
-        valid = np.isfinite(position[..., :3]).all(axis=-1) & (position[..., 3] < 1.0)
-        world = world.astype(np.float32, copy=False)
+    world = world.astype(np.float32, copy=False)
+    if valid is not None:
         world[~valid] = np.nan
     return world.astype(np.float32, copy=False)
 
@@ -287,7 +316,105 @@ def _npy_b64(array: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY, env: Any | None = None) -> dict[str, Any]:
+def _render_vlm_bgr_with_shader(env: Any, camera_key: str, shader_dir: str | None) -> np.ndarray | None:
+    """Render an RGB-only VLM view from a pre-created shader-specific camera.
+
+    This is intentionally separate from the RGB-D payload. The normal observation
+    remains depth-compatible, while this optional pass can use a minimal clone for
+    a cleaner/lighter VLM image. SAPIEN binds a camera's shader at creation time,
+    so changing set_camera_shader_dir after a camera exists is not sufficient.
+    """
+    shader_dir = str(shader_dir or "").strip()
+    if not shader_dir:
+        return None
+
+    cams = getattr(env, "cameras", None)
+    get_vlm_camera = getattr(cams, "get_vlm_camera", None)
+    camera = get_vlm_camera(camera_key) if callable(get_vlm_camera) else None
+    if camera is None:
+        print(
+            f"[sim-server] no VLM camera clone for {camera_key}; "
+            "restart RMBench after setting sim_vlm_camera_shader_dir."
+        )
+        return None
+
+    try:
+        camera.take_picture()
+        rgba = np.asarray(camera.get_picture("Color"))
+        rgb = (rgba[..., :3] * 255).clip(0, 255).astype(np.uint8)
+        return cv.cvtColor(rgb, cv.COLOR_RGB2BGR)
+    except Exception as exc:
+        print(f"[sim-server] could not read VLM RGB from shader '{shader_dir}': {exc}")
+        return None
+
+
+def _quat_wxyz_to_matrix(quat: np.ndarray) -> np.ndarray | None:
+    try:
+        q = np.asarray(quat, dtype=np.float64).reshape(4)
+    except (TypeError, ValueError):
+        return None
+    norm = float(np.linalg.norm(q))
+    if not np.isfinite(norm) or norm <= 0.0:
+        return None
+    w, x, y, z = q / norm
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _control_metadata_from_env(env: Any, arm: str = CONTROLLED_ARM) -> dict[str, Any]:
+    """Runtime control-frame geometry for SVLR action generation.
+
+    RMBench `ee` actions are expressed in the pose returned by get_*_ee_pose(),
+    while the visually useful manipulation point is the TCP/gripper center from
+    get_*_tcp_pose().  Their local offset comes from the loaded robot model, so
+    SVLR does not need a task-specific or object-specific Z clamp.
+    """
+    robot = getattr(env, "robot", None)
+    if robot is None:
+        return {}
+    get_ee = getattr(robot, f"get_{arm}_ee_pose", None)
+    get_tcp = getattr(robot, f"get_{arm}_tcp_pose", None)
+    if not callable(get_ee) or not callable(get_tcp):
+        return {}
+    try:
+        ee_pose = np.asarray(get_ee(), dtype=np.float64).reshape(-1)
+        tcp_pose = np.asarray(get_tcp(), dtype=np.float64).reshape(-1)
+    except Exception as exc:
+        print(f"[sim-server] could not compute control metadata for {arm}: {exc}")
+        return {}
+    if ee_pose.size < 7 or tcp_pose.size < 3:
+        return {}
+
+    rotation = _quat_wxyz_to_matrix(ee_pose[3:7])
+    if rotation is None:
+        return {}
+    command_to_tcp_world = tcp_pose[:3] - ee_pose[:3]
+    command_to_tcp_local = rotation.T @ command_to_tcp_world
+    if not np.isfinite(command_to_tcp_local).all():
+        return {}
+    return {
+        "arm": str(arm),
+        "command_frame": "rmbench_ee_pose",
+        "target_frame": "tcp",
+        "command_to_tcp_local_m": command_to_tcp_local.astype(float).tolist(),
+        "command_to_tcp_world_m": command_to_tcp_world.astype(float).tolist(),
+        "command_to_tcp_distance_m": float(np.linalg.norm(command_to_tcp_world)),
+    }
+
+
+def extract_camera_payload(
+    obs: Any,
+    camera_key: str = CAMERA_KEY,
+    env: Any | None = None,
+    controlled_arm: str = CONTROLLED_ARM,
+    vlm_camera_shader_dir: str | None = None,
+) -> dict[str, Any]:
     """Observation -> SVLR remote RGB-D payload.
 
     Extra field for simulation calibration:
@@ -312,6 +439,12 @@ def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY, env: Any | No
     if world_xyz is not None:
         world_xyz_b64 = _npy_b64(world_xyz)
 
+    vlm_bgr = (
+        _render_vlm_bgr_with_shader(env, used_camera_key, vlm_camera_shader_dir)
+        if env is not None
+        else None
+    )
+
     h, w = rgb.shape[:2]
     intr = cam.get("intrinsic_cv") if isinstance(cam, dict) else None
     if intr is not None:
@@ -327,9 +460,13 @@ def extract_camera_payload(obs: Any, camera_key: str = CAMERA_KEY, env: Any | No
         "depth_npy_b64": depth_b64,
         "world_xyz_npy_b64": world_xyz_b64,
         "intrinsics": intrinsics,
+        "control_metadata": _control_metadata_from_env(env, controlled_arm) if env is not None else {},
         "camera_name": str(used_camera_key),
         "timestamp_s": time.time(),
     }
+    if vlm_bgr is not None:
+        payload["vlm_color_bgr_jpeg_b64"] = _jpeg_b64(vlm_bgr)
+        payload["vlm_camera_shader_dir"] = str(vlm_camera_shader_dir)
     if isinstance(cam, dict):
         if cam.get("cam2world_gl") is not None:
             payload["cam2world_gl"] = np.asarray(cam["cam2world_gl"], dtype=float).tolist()
@@ -422,7 +559,12 @@ def svlr_action_has_position(svlr_action: dict) -> bool:
     )
 
 
-def build_take_action(svlr_action: dict, cmd: np.ndarray, arm: str = CONTROLLED_ARM) -> np.ndarray:
+def build_take_action(
+    svlr_action: dict,
+    cmd: np.ndarray,
+    arm: str = CONTROLLED_ARM,
+    mirror_single_arm: bool = False,
+) -> np.ndarray:
     base = _ARM_BASE[arm]
     out = cmd.copy()
     print("[sim-server] SVLR action:", svlr_action)
@@ -452,6 +594,19 @@ def build_take_action(svlr_action: dict, cmd: np.ndarray, arm: str = CONTROLLED_
     if "gripper" in svlr_action or "ee.gripper_pos" in svlr_action:
         raw = svlr_action.get("gripper", svlr_action.get("ee.gripper_pos"))
         out[base + 7] = map_gripper(float(raw))
+
+    if mirror_single_arm:
+        # demo_clean_franka represents one physical Franka through RMBench's
+        # left/right 16D layout. If only the controlled slot changes, take_action
+        # plans a "hold" trajectory for the other slot and a "move" trajectory
+        # for the same underlying robot, which produces conflicting commands.
+        other_arm = "left" if arm == "right" else "right"
+        other_base = _ARM_BASE[other_arm]
+        out[other_base:other_base + 8] = out[base:base + 8]
+        print(
+            f"[sim-server] mirrored {arm} command to {other_arm} "
+            "for single-arm RMBench embodiment"
+        )
     return out
 
 def requested_ee_xyz(cmd: np.ndarray, arm: str = CONTROLLED_ARM) -> np.ndarray:
@@ -642,7 +797,10 @@ class SimServer:
                  max_substeps_per_action=MAX_SUBSTEPS_PER_ACTION,
                  min_substeps_per_action=MIN_SUBSTEPS_PER_ACTION,
                  finish_idle_s=FINISH_IDLE_S,
-                 home_on_reset=HOME_ON_RESET, home_controlled=None) -> None:
+                 home_on_reset=HOME_ON_RESET, home_controlled=None,
+                 mirror_single_arm=False,
+                 keep_alive_after_actions=False,
+                 vlm_camera_shader_dir: str | None = None) -> None:
         self.host, self.port = host, port
         self.controlled_arm = controlled_arm
         self.action_poll_s = float(action_poll_s)
@@ -656,6 +814,9 @@ class SimServer:
         self.max_substeps_per_action = int(max_substeps_per_action)
         self.min_substeps_per_action = int(min_substeps_per_action)
         self.finish_idle_s = float(finish_idle_s)
+        self.mirror_single_arm = bool(mirror_single_arm)
+        self.keep_alive_after_actions = bool(keep_alive_after_actions)
+        self.vlm_camera_shader_dir = str(vlm_camera_shader_dir or "").strip()
         if self.finish_idle_s < 0.0:
             raise ValueError("finish_idle_s must be >= 0")
         self._driver_state_lock = threading.Lock()
@@ -703,7 +864,10 @@ class SimServer:
             time.sleep(0.01)
         print(f"[sim-server] http://{self.host}:{self.port}  "
               f"(arm: {self.controlled_arm}, camera: {self.camera_key})  "
-              f"drive={'on->' + self.svlr_url if self.drive else 'off'}")
+              f"drive={'on->' + self.svlr_url if self.drive else 'off'}  "
+              f"mirror_single_arm={self.mirror_single_arm}  "
+              f"keep_alive_after_actions={self.keep_alive_after_actions}  "
+              f"vlm_shader={self.vlm_camera_shader_dir or 'same'}")
         if self.drive:
             self._driver_thread = threading.Thread(target=self._drive_loop, daemon=True)
             self._driver_thread.start()
@@ -826,11 +990,23 @@ class SimServer:
         else:
             measured = _endpose_from_obs(observation)
             pose = pose_for_svlr(measured if measured is not None else self._cmd, self.controlled_arm)
-            self.bridge.publish(pose, extract_camera_payload(observation, self.camera_key, env=env), sim_list_entities(env))
+            self.bridge.publish(
+                pose,
+                extract_camera_payload(
+                    observation,
+                    self.camera_key,
+                    env=env,
+                    controlled_arm=self.controlled_arm,
+                    vlm_camera_shader_dir=self.vlm_camera_shader_dir,
+                ),
+                sim_list_entities(env),
+            )
 
         action = None
         wait_started = time.monotonic()
         last_wait_log = 0.0
+        driver_finished_since: Optional[float] = None
+        keep_alive_logged = False
 
         # Keep SAPIEN viewer responsive while waiting for SVLR/curl.
         # action_poll_s=0.1 gives only ~10 Hz max, so use a shorter queue timeout
@@ -854,19 +1030,38 @@ class SimServer:
                 last_idle_render = now
             driver_finished, driver_failed = self._driver_done()
             if self.drive and driver_finished:
-                idle_s = now - wait_started
+                if driver_finished_since is None:
+                    driver_finished_since = now
+                    print(
+                        "[sim-server] SVLR driver returned; waiting for queued "
+                        "low-level actions before ending episode"
+                    )
+                idle_s = now - driver_finished_since
                 if idle_s >= self.finish_idle_s:
                     actions_seen = self.bridge.action_count()
+                    if (
+                        self.keep_alive_after_actions
+                        and actions_seen > 0
+                        and not driver_failed
+                    ):
+                        if not keep_alive_logged:
+                            print(
+                                "[sim-server] SVLR action sequence is idle; "
+                                "keeping RMBench alive for inspection "
+                                "(POST /stop or Ctrl-C to end)"
+                            )
+                            keep_alive_logged = True
+                        continue
                     if actions_seen == 0:
                         print(
                             f"[sim-server] SVLR driver finished but produced no action "
-                            f"after {idle_s:.1f}s; ending episode "
+                            f"after {idle_s:.1f}s post-driver idle; ending episode "
                             f"(driver_failed={driver_failed})"
                         )
                     else:
                         print(
                             f"[sim-server] SVLR driver finished and no new action arrived "
-                            f"for {idle_s:.1f}s; ending episode "
+                            f"for {idle_s:.1f}s post-driver idle; ending episode "
                             f"(driver_failed={driver_failed}, actions={actions_seen})"
                         )
                     self.bridge.set_done(
@@ -877,6 +1072,9 @@ class SimServer:
                     with contextlib.suppress(Exception):
                         env.take_action_cnt = env.step_lim
                     return
+            else:
+                driver_finished_since = None
+                keep_alive_logged = False
             if now - last_wait_log >= 10.0:
                 print(f"[sim-server] waiting for SVLR action... "
                       f"({now - wait_started:.1f}s; POST /stop or Ctrl-C to end)")
@@ -894,7 +1092,12 @@ class SimServer:
         # once RMBench/SAPIEN has physically advanced the command.
         self.bridge.set_end_action(False)
         has_position_target = svlr_action_has_position(action)
-        self._cmd = build_take_action(action, self._cmd, self.controlled_arm)
+        self._cmd = build_take_action(
+            action,
+            self._cmd,
+            self.controlled_arm,
+            mirror_single_arm=self.mirror_single_arm,
+        )
         run_for = self._execute_until_ee_reached(env, has_position_target=has_position_target)
         with contextlib.suppress(Exception):
             self._save_debug_camera_images(env.get_obs(), f"after{env.take_action_cnt}")
@@ -906,8 +1109,17 @@ class SimServer:
         if bool(getattr(env, "eval_success", False)):
             self.bridge.set_done(True)
             with contextlib.suppress(Exception):
-                self.bridge.publish(pose_for_svlr(self._cmd, self.controlled_arm),
-                                    extract_camera_payload(env.get_obs(), self.camera_key, env=env), sim_list_entities(env))
+                self.bridge.publish(
+                    pose_for_svlr(self._cmd, self.controlled_arm),
+                    extract_camera_payload(
+                        env.get_obs(),
+                        self.camera_key,
+                        env=env,
+                        controlled_arm=self.controlled_arm,
+                        vlm_camera_shader_dir=self.vlm_camera_shader_dir,
+                    ),
+                    sim_list_entities(env),
+                )
                 self.bridge.set_end_action(True)
 
     # -- first step: drive to the fixed home pose, then publish + engage SVLR --
@@ -927,7 +1139,17 @@ class SimServer:
         pub_obs = env.get_obs()
         m = _endpose_from_obs(pub_obs)
         pose = pose_for_svlr(m if m is not None else self._cmd, self.controlled_arm)
-        self.bridge.publish(pose, extract_camera_payload(pub_obs, self.camera_key, env=env), sim_list_entities(env))
+        self.bridge.publish(
+            pose,
+            extract_camera_payload(
+                pub_obs,
+                self.camera_key,
+                env=env,
+                controlled_arm=self.controlled_arm,
+                vlm_camera_shader_dir=self.vlm_camera_shader_dir,
+            ),
+            sim_list_entities(env),
+        )
         self.bridge.set_end_action(True)
 
         with contextlib.suppress(Exception):
@@ -969,7 +1191,13 @@ class SimServer:
         pose = pose_for_svlr(measured if measured is not None else self._cmd, self.controlled_arm)
         self.bridge.publish(
             pose,
-            extract_camera_payload(observation, self.camera_key, env=env),
+            extract_camera_payload(
+                observation,
+                self.camera_key,
+                env=env,
+                controlled_arm=self.controlled_arm,
+                vlm_camera_shader_dir=self.vlm_camera_shader_dir,
+            ),
             sim_list_entities(env),
         )
 
@@ -1007,6 +1235,21 @@ def _as_bool(v) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _optional_bool(usr_args, key, env_key):
+    if usr_args and key in usr_args and usr_args[key] is not None:
+        value = str(usr_args[key]).strip().lower()
+        if value in ("", "auto", "none", "null"):
+            return None
+        return _as_bool(value)
+    value = os.environ.get(env_key)
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in ("", "auto", "none", "null"):
+        return None
+    return _as_bool(value)
+
+
 def _as_vec(v):
     """Accept a list/tuple or a comma-separated string -> list[float]."""
     if isinstance(v, (list, tuple)):
@@ -1022,6 +1265,20 @@ def get_model(usr_args=None):
             home_controlled = _as_vec(usr_args["sim_home_controlled"])
         elif os.environ.get("SIM_HOME_CONTROLLED"):
             home_controlled = _as_vec(os.environ["SIM_HOME_CONTROLLED"])
+        mirror_single_arm = _optional_bool(usr_args, "sim_mirror_single_arm", "SIM_MIRROR_SINGLE_ARM")
+        if mirror_single_arm is None:
+            mirror_single_arm = bool(usr_args and usr_args.get("dual_arm_embodied", False))
+        vlm_camera_shader_dir = _cfg(
+            usr_args,
+            "sim_vlm_camera_shader_dir",
+            "SIM_VLM_CAMERA_SHADER_DIR",
+            "",
+            str,
+        ).strip()
+        if vlm_camera_shader_dir:
+            os.environ["RMBENCH_VLM_CAMERA_SHADER_DIR"] = vlm_camera_shader_dir
+        else:
+            os.environ.pop("RMBENCH_VLM_CAMERA_SHADER_DIR", None)
         _SERVER = SimServer(
             host=_cfg(usr_args, "sim_host", "SIM_HOST", "0.0.0.0", str),
             port=_cfg(usr_args, "sim_port", "SIM_PORT", 65500, int),
@@ -1042,6 +1299,15 @@ def get_model(usr_args=None):
                                FINISH_IDLE_S, float),
             home_on_reset=_cfg(usr_args, "sim_home", "SIM_HOME", HOME_ON_RESET, _as_bool),
             home_controlled=home_controlled,
+            mirror_single_arm=mirror_single_arm,
+            keep_alive_after_actions=_cfg(
+                usr_args,
+                "sim_keep_alive_after_actions",
+                "SIM_KEEP_ALIVE_AFTER_ACTIONS",
+                False,
+                _as_bool,
+            ),
+            vlm_camera_shader_dir=vlm_camera_shader_dir,
         )
         _SERVER.start()
     return _SERVER
@@ -1065,7 +1331,7 @@ def eval(TASK_ENV, model, observation):
 
 
 class MockSimEnv:
-    EE_STEP_M = 0.05  # EE moves up to this far per take_action (mimics a finite arm speed)
+    EE_STEP_M = 0.05  # Mock-only: expose partial motion for bridge debug logs.
 
     def __init__(self, w=640, h=480, step_lim=100000):
         self.w, self.h, self.step_lim = w, h, step_lim
@@ -1078,8 +1344,9 @@ class MockSimEnv:
 
     def take_action(self, action, action_type="ee"):
         target = np.asarray(action, dtype=np.float64).reshape(-1)
-        # Move each arm's EE xyz toward the target by at most EE_STEP_M; snap the
-        # orientation + gripper. This makes the EE-position gate take a few substeps.
+        # Move each arm's EE xyz toward the target by at most EE_STEP_M; snap
+        # orientation + gripper. Real RMBench take_action is dense and normally
+        # reaches the planned target in one call.
         for base in (0, 8):
             cur = self._endpose[base:base + 3]
             d = target[base:base + 3] - cur
@@ -1127,6 +1394,21 @@ def parse_args():
     p.add_argument("--svlr-url", default="http://127.0.0.1:7860")
     p.add_argument("--camera-key", default=CAMERA_KEY)
     p.add_argument("--save-debug-images", action="store_true")
+    p.add_argument(
+        "--mirror-single-arm",
+        action="store_true",
+        help="Mirror the controlled arm command into both 16D slots for one-robot RMBench embodiments.",
+    )
+    p.add_argument(
+        "--keep-alive-after-actions",
+        action="store_true",
+        help="Keep the mock harness alive after SVLR actions finish; stop with POST /stop or Ctrl-C.",
+    )
+    p.add_argument(
+        "--vlm-camera-shader-dir",
+        default="",
+        help="Optional RGB-only SAPIEN camera shader for the image sent to SVLR's VLM.",
+    )
     return p.parse_args()
 
 
@@ -1139,7 +1421,10 @@ def main():
     _SERVER = SimServer(host=args.host, port=args.port, controlled_arm=args.arm,
                         drive=args.drive, svlr_url=args.svlr_url,
                         camera_key=args.camera_key,
-                        save_debug_images=args.save_debug_images)
+                        save_debug_images=args.save_debug_images,
+                        mirror_single_arm=args.mirror_single_arm,
+                        keep_alive_after_actions=args.keep_alive_after_actions,
+                        vlm_camera_shader_dir=args.vlm_camera_shader_dir)
     _SERVER.start()
     try:
         _run_mock_harness(_SERVER)

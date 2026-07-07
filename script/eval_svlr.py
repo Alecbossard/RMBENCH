@@ -177,6 +177,8 @@ def main(usr_args):
     args["policy_name"] = policy_name
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
+    usr_args["dual_arm_embodied"] = bool(args.get("dual_arm_embodied", False))
+    usr_args["dual_arm"] = bool(args.get("dual_arm", True))
 
     seed = usr_args["seed"]
 

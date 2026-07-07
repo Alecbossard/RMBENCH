@@ -22,5 +22,7 @@ python script/eval_svlr.py --config policy/SVLR/deploy_policy.yml --overrides \
     --sim_save_debug_images true \
     --sim_drive true \
     --sim_finish_idle_s 5.0 \
-  --sim_home false \
+    --sim_home false \
+    --sim_mirror_single_arm auto \
+    --sim_keep_alive_after_actions false \
     --sim_min_substeps 8

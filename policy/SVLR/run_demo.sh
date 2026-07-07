@@ -23,6 +23,8 @@ SIM_CAMERA_KEY="${SIM_CAMERA_KEY:-right_camera}"
 SIM_SAVE_DEBUG_IMAGES="${SIM_SAVE_DEBUG_IMAGES:-true}"
 SIM_DRIVE="${SIM_DRIVE:-true}"
 SIM_HOME="${SIM_HOME:-false}"
+SIM_MIRROR_SINGLE_ARM="${SIM_MIRROR_SINGLE_ARM:-auto}"
+SIM_KEEP_ALIVE_AFTER_ACTIONS="${SIM_KEEP_ALIVE_AFTER_ACTIONS:-false}"
 RENDER_FREQ="${RENDER_FREQ:-30}"
 INSTRUCTION_TYPE="${INSTRUCTION_TYPE:-unseen}"
 EPISODE_NUM="${EPISODE_NUM:-1}"
@@ -43,4 +45,6 @@ pixi run -e svlr python script/eval_svlr.py --config policy/SVLR/deploy_policy.y
   --sim_save_debug_images "${SIM_SAVE_DEBUG_IMAGES}" \
   --sim_drive "${SIM_DRIVE}" \
   --sim_home "${SIM_HOME}" \
+  --sim_mirror_single_arm "${SIM_MIRROR_SINGLE_ARM}" \
+  --sim_keep_alive_after_actions "${SIM_KEEP_ALIVE_AFTER_ACTIONS}" \
   --render_freq "${RENDER_FREQ}"

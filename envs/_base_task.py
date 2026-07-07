@@ -38,6 +38,26 @@ class Base_Task(gym.Env):
     def __init__(self):
         pass
 
+    def _configure_camera_shader(self):
+        shader_dir = os.environ.get("RMBENCH_CAMERA_SHADER_DIR", "").strip()
+        if not shader_dir:
+            return
+
+        sapien.render.set_camera_shader_dir(shader_dir)
+        if shader_dir.lower() == "rt":
+            samples = int(os.environ.get("RMBENCH_RT_SPP", "16"))
+            path_depth = int(os.environ.get("RMBENCH_RT_PATH_DEPTH", "8"))
+            denoiser = os.environ.get("RMBENCH_RT_DENOISER", "none")
+            sapien.render.set_ray_tracing_samples_per_pixel(samples)
+            sapien.render.set_ray_tracing_path_depth(path_depth)
+            sapien.render.set_ray_tracing_denoiser(denoiser)
+            print(
+                f"[render] camera shader=rt spp={samples} "
+                f"path_depth={path_depth} denoiser={denoiser}"
+            )
+        else:
+            print(f"[render] camera shader={shader_dir}")
+
     # =========================================================== Init Task Env ===========================================================
     def _init_task_env_(self, table_xy_bias=[0, 0], table_height_bias=0, **kwags):
         """
@@ -217,15 +237,10 @@ class Base_Task(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        # SVLR demo patch:
-        # Disable SAPIEN ray tracing + OIDN denoiser.
-        # On some NVIDIA/Vulkan setups OIDN crashes with:
-        #   [svulkan2] [error] OIDN Error: CUTLASS error
-        # RGB-D cameras still work with the default raster renderer.
-        # sapien.render.set_camera_shader_dir("rt")
-        # sapien.render.set_ray_tracing_samples_per_pixel(32)
-        # sapien.render.set_ray_tracing_path_depth(8)
-        # sapien.render.set_ray_tracing_denoiser("oidn")
+        # Keep the default raster renderer unless explicitly overridden. The
+        # camera wrapper handles both SAPIEN "Position" and the minimal-shader
+        # "PositionSegmentation" packed texture for RGB-D/world XYZ.
+        self._configure_camera_shader()
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
