@@ -9,6 +9,15 @@ RMBench: Memory-Dependent Robotic Manipulation Benchmark with Insights into Poli
 For the SVLR bridge used in this branch, see
 [README_SVLR_BRIDGE_QUICKSTART.md](README_SVLR_BRIDGE_QUICKSTART.md).
 
+Fast path for the SVLR bridge:
+
+```bash
+cd ~/RMBench/RMBench
+git checkout svlr-bridge-complete
+bash script/setup_svlr_bridge.sh
+bash policy/SVLR/run_demo.sh
+```
+
 > This project is built upon [RoboTwin 2.0](https://github.com/robotwin-Platform/RoboTwin), and you can seamlessly transfer your policy code between the two projects.
 
 ## 1. Installation

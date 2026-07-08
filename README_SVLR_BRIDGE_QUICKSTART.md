@@ -15,6 +15,40 @@ cd ~/RMBench/RMBench
 git checkout svlr-bridge-complete
 ```
 
+## Fresh Setup
+
+Clone matching branches:
+
+```bash
+git clone https://github.com/Alecbossard/svlr.git ~/svlr-pr6
+git clone https://github.com/Alecbossard/RMBENCH.git ~/RMBench/RMBench
+
+cd ~/svlr-pr6
+git checkout svlr-rmbench-complete
+
+cd ~/RMBench/RMBench
+git checkout svlr-bridge-complete
+```
+
+Install/prep the SVLR side:
+
+```bash
+cd ~/svlr-pr6
+conda activate SVLR
+bash scripts/setup_rmbench_bridge.sh
+```
+
+Install/prep the RMBench side:
+
+```bash
+cd ~/RMBench/RMBench
+bash script/setup_svlr_bridge.sh
+```
+
+The RMBench setup downloads the required objects and embodiments from Hugging
+Face, including the Franka embodiment fallback from `TianxingChen/RoboTwin2.0`
+when needed, then rewrites generated CuRobo YAML paths for the local checkout.
+
 ## Start SVLR
 
 Terminal 1:
@@ -46,27 +80,11 @@ Terminal 2:
 
 ```bash
 cd ~/RMBench/RMBench
-RMBENCH_SWAP_DEBUG_SUCCESS=1 pixi run -e svlr python script/eval_svlr.py \
-  --config policy/SVLR/deploy_policy.yml \
-  --overrides \
-  --task_name swap_blocks \
-  --task_config demo_clean_franka \
-  --policy_name SVLR \
-  --ckpt_setting svlr_swap_debug \
-  --seed 0 \
-  --instruction_type unseen \
-  --episode_num 1 \
-  --global_task "Swap the positions of the two blocks and after press the button." \
-  --sim_camera_key right_camera \
-  --sim_vlm_camera_shader_dir minimal \
-  --sim_save_debug_images true \
-  --sim_drive true \
-  --sim_home true \
-  --sim_arm right \
-  --sim_mirror_single_arm auto \
-  --sim_keep_alive_after_actions false \
-  --render_freq 1
+bash policy/SVLR/run_demo.sh
 ```
+
+The script expands to the full `pixi run -e svlr python script/eval_svlr.py ...`
+command with the working `swap_blocks` defaults.
 
 ## What Should Happen
 
@@ -127,9 +145,14 @@ Enable `RMBENCH_SWAP_DEBUG_SUCCESS=1` and verify that `gripper_close`,
 
 ```bash
 cd ~/RMBench/RMBench
+bash script/setup_svlr_bridge.sh
+```
+
+For syntax-only validation:
+
+```bash
 pixi run -e svlr python -m py_compile \
   script/eval_svlr.py \
   policy/SVLR/deploy_policy.py \
   envs/swap_blocks.py
 ```
-

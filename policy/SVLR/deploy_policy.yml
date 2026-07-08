@@ -1,11 +1,11 @@
 # Basic experiment configuration
 policy_name: SVLR
-task_name: press_button
+task_name: swap_blocks
 task_config: demo_clean_franka
-ckpt_setting: svlr_debug
+ckpt_setting: svlr_swap_debug
 seed: 0
 instruction_type: unseen
-global_task: null
+global_task: "Swap the positions of the two blocks and after press the button."
 episode_num: 1
 
 # SVLR bridge configuration
@@ -19,12 +19,12 @@ sim_drive: true
 sim_camera_key: right_camera
 sim_call_vlm: true
 sim_save_debug_images: true
-sim_vlm_camera_shader_dir: ""
+sim_vlm_camera_shader_dir: minimal
 sim_finish_idle_s: 5.0
 sim_keep_alive_after_actions: false
 
 # Motion/completion tuning
-sim_home: false
+sim_home: true
 # auto mirrors commands only for one-robot RMBench embodiments exposed as left/right.
 sim_mirror_single_arm: auto
 sim_ee_pos_tol: 0.02
