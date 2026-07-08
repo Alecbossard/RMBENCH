@@ -62,6 +62,59 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
+def _validate_runtime_files(task_name, task_config, args):
+    """Fail early with setup instructions instead of late SAPIEN/Curobo errors."""
+    required = []
+
+    def resolve(base, rel):
+        if rel is None:
+            return None
+        path = Path(str(rel))
+        return path if path.is_absolute() else base / path
+
+    robot_specs = [
+        (args.get("left_robot_file"), args.get("left_embodiment_config", {}), "left"),
+        (args.get("right_robot_file"), args.get("right_embodiment_config", {}), "right"),
+    ]
+    for robot_file, cfg, arm in robot_specs:
+        if not robot_file:
+            continue
+        base = Path(robot_file)
+        required.append(base / "config.yml")
+        required.append(resolve(base, cfg.get("urdf_path")))
+        if cfg.get("srdf_path") is not None:
+            required.append(resolve(base, cfg.get("srdf_path")))
+        required.append(base / "curobo.yml")
+        if args.get("dual_arm_embodied"):
+            required.append(base / f"curobo_{arm}.yml")
+
+    if task_name == "swap_blocks":
+        required.extend([
+            Path("assets/objects/002_breadbasket/model_data1.json"),
+            Path("assets/objects/002_breadbasket/collision/base1.glb"),
+            Path("assets/objects/002_breadbasket/visual/base1.glb"),
+            Path("assets/objects/005_button/10124/mobility.urdf"),
+            Path("assets/objects/005_button/10124/model_data.json"),
+            Path("assets/objects/cube/textured.obj"),
+            Path("assets/objects/same.json"),
+            Path("assets/objects/objaverse/list.json"),
+        ])
+    if task_name == "swap_blocks" and task_config == "demo_clean_franka":
+        required.extend([
+            Path("data/data/swap_blocks/demo_clean/scene_info.json"),
+            Path("data/data/swap_blocks/demo_clean/seed.txt"),
+            Path("data/data/swap_blocks/demo_clean/language_annotation.json"),
+        ])
+    missing = [str(path) for path in required if path is not None and not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing RMBench/SVLR setup files. Run `pixi run -e svlr setup` "
+            "or at least `pixi run -e svlr download-assets && pixi run -e svlr download-data "
+            "&& pixi run -e svlr configure-embodiments`. Missing: "
+            + ", ".join(missing)
+        )
+
+
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
@@ -97,7 +150,15 @@ def main(usr_args):
         if _key in usr_args and usr_args[_key] is not None:
             args[_key] = _cast(usr_args[_key])
 
-    print(f"[SVLR eval] render_freq={args.get('render_freq')} eval_video_log={args.get('eval_video_log')}")
+    if "skip_expert_check" in usr_args and usr_args["skip_expert_check"] is not None:
+        _value = usr_args["skip_expert_check"]
+        args["skip_expert_check"] = bool(_value) if isinstance(_value, bool) else str(_value).lower() in ("1", "true", "yes", "on")
+
+    print(
+        f"[SVLR eval] render_freq={args.get('render_freq')} "
+        f"eval_video_log={args.get('eval_video_log')} "
+        f"skip_expert_check={args.get('skip_expert_check', False)}"
+    )
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -132,6 +193,12 @@ def main(usr_args):
 
     args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
     args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])
+    _validate_runtime_files(task_name, task_config, args)
+    if len(embodiment_type) == 1 and args["left_embodiment_config"].get("dual_arm") is False:
+        print(
+            "[SVLR eval] single physical embodiment exposed as logical left/right slots: "
+            f"{embodiment_type[0]}"
+        )
 
     if len(embodiment_type) == 1:
         embodiment_name = str(embodiment_type[0])
@@ -179,6 +246,10 @@ def main(usr_args):
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
     usr_args["dual_arm_embodied"] = bool(args.get("dual_arm_embodied", False))
     usr_args["dual_arm"] = bool(args.get("dual_arm", True))
+    usr_args["single_physical_dual_slot"] = bool(
+        args.get("dual_arm_embodied", False)
+        and args["left_embodiment_config"].get("dual_arm") is False
+    )
 
     seed = usr_args["seed"]
 
@@ -239,7 +310,13 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    debug_success = os.environ.get("RMBENCH_SWAP_DEBUG_SUCCESS", "").strip().lower() in {"1", "true", "yes", "on"}
+    skip_expert_check = bool(args.get("skip_expert_check", False))
+    expert_check = not debug_success and not skip_expert_check
+    if debug_success:
+        print("[SVLR eval] RMBENCH_SWAP_DEBUG_SUCCESS=1: skipping expert seed pre-check and forcing swap_blocks success checks")
+    elif skip_expert_check:
+        print("[SVLR eval] skip_expert_check=true: starting the visible SVLR episode directly")
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -258,6 +335,7 @@ def eval_policy(task_name,
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        episode_info = {"info": {}}
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 

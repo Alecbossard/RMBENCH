@@ -29,7 +29,10 @@ RENDER_FREQ="${RENDER_FREQ:-30}"
 INSTRUCTION_TYPE="${INSTRUCTION_TYPE:-unseen}"
 EPISODE_NUM="${EPISODE_NUM:-1}"
 
-fuser -k -9 65500/tcp || true
+if command -v fuser >/dev/null 2>&1 && fuser -s 65500/tcp; then
+  echo "Port 65500 is already in use. Stop the previous RMBench bridge (Ctrl-C or POST /stop) before re-running." >&2
+  exit 1
+fi
 rm -f svlr_bridge_*.png
 
 pixi run -e svlr python script/eval_svlr.py --config policy/SVLR/deploy_policy.yml --overrides \

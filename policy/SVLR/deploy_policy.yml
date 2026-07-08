@@ -7,6 +7,9 @@ seed: 0
 instruction_type: unseen
 global_task: null
 episode_num: 1
+# SVLR is the policy under test; do not run the hidden scripted expert
+# pre-check that forces render_freq=0 and delays the visible SAPIEN episode.
+skip_expert_check: true
 
 # SVLR bridge configuration
 # Start SVLR first with: bash run_svlr_rmbench.sh
