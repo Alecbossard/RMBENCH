@@ -1,6 +1,7 @@
 from ._base_task import Base_Task
 from .utils import *
 from copy import deepcopy
+import os
 
 class swap_blocks(Base_Task):
     
@@ -82,6 +83,7 @@ class swap_blocks(Base_Task):
         self.set_button_unpressed(self.button)
         self.press_cnt = 0
         self.press_flag = False
+        self._last_success_debug_signature = None
 
     def get_current_button_value(self, button_name, button_actor, joint_name="button_joint", target=0.0):
         if button_name == 'button':
@@ -205,21 +207,98 @@ class swap_blocks(Base_Task):
             arm = "left"
         return arm
 
+    def _debug_check_success(
+        self,
+        success,
+        basket1_pose,
+        basket2_pose,
+        block1_pose,
+        block2_pose,
+        checks,
+        button_value,
+    ):
+        if os.environ.get("RMBENCH_SWAP_DEBUG_SUCCESS", "0").lower() not in ("1", "true", "yes", "on"):
+            return
+
+        signature = (
+            int(getattr(self, "take_action_cnt", -1)),
+            bool(success),
+            tuple(bool(checks[k]) for k in sorted(checks)),
+            int(self.press_cnt),
+            bool(self.press_flag),
+            bool(self.flag),
+        )
+        if signature == self._last_success_debug_signature:
+            return
+        self._last_success_debug_signature = signature
+
+        b2_to_basket1 = np.abs(basket1_pose[:2] - block2_pose[:2])
+        b1_to_basket2 = np.abs(basket2_pose[:2] - block1_pose[:2])
+        print("\n[swap_blocks debug] check_success")
+        print(f"  action_step={getattr(self, 'take_action_cnt', None)} success={bool(success)} max_reward={self.max_reward}")
+        print(
+            "  basket indices: "
+            f"block1_start={self.with_block_basket_idx_1} "
+            f"block2_start={self.with_block_basket_idx_2} "
+            f"empty_start={self.empty_basket_idx}"
+        )
+        print(f"  basket1_pose={np.round(basket1_pose, 4)}")
+        print(f"  basket2_pose={np.round(basket2_pose, 4)}")
+        print(f"  block1_pose ={np.round(block1_pose, 4)}  target=basket2")
+        print(f"  block2_pose ={np.round(block2_pose, 4)}  target=basket1")
+        print(
+            "  block2->basket1: "
+            f"dx={b2_to_basket1[0]:.4f}<0.04={checks['block2_x']} "
+            f"dy={b2_to_basket1[1]:.4f}<0.06={checks['block2_y']} "
+            f"z={block2_pose[2]:.4f}<0.765={checks['block2_z']}"
+        )
+        print(
+            "  block1->basket2: "
+            f"dx={b1_to_basket2[0]:.4f}<0.04={checks['block1_x']} "
+            f"dy={b1_to_basket2[1]:.4f}<0.06={checks['block1_y']} "
+            f"z={block1_pose[2]:.4f}<0.765={checks['block1_z']}"
+        )
+        print(
+            "  other: "
+            f"gripper_close={checks['gripper_close']} "
+            f"flag_no_overlap={checks['flag']} "
+            f"press_cnt={self.press_cnt} "
+            f"press_flag={self.press_flag} "
+            f"button_qpos={button_value:.4f}"
+        )
+
     def check_success(self):
         self.update_button_reset(self.button, "press_flag")
         self.update_press_success(self.button, "press_flag", "press_cnt")
-        self.set_button_unpressed(self.button, target=min(0.0, self.get_current_button_value("button", self.button)+0.002))
-        if not self.flag:
-            return False
+        button_value = self.get_current_button_value("button", self.button)
+        self.set_button_unpressed(self.button, target=min(0.0, button_value+0.002))
         basket1_pose = self.baskets[self.with_block_basket_idx_1].get_pose().p
         basket2_pose = self.baskets[self.with_block_basket_idx_2].get_pose().p
         block1_pose = self.block1.get_pose().p
         block2_pose = self.block2.get_pose().p
         self.is_two_blocks(self.block1, self.block2)
-        success = np.abs(basket1_pose[0] - block2_pose[0]) < 0.04 and np.abs(basket1_pose[1] - block2_pose[1]) < 0.06 and block2_pose[2] < 0.765 \
-                    and np.abs(basket2_pose[0] - block1_pose[0]) < 0.04 and np.abs(basket2_pose[1] - block1_pose[1]) < 0.06 and block1_pose[2] < 0.765 \
-                    and self.is_right_gripper_open() and self.flag \
-                    and self.press_cnt == 1 and self.press_flag
+        checks = {
+            "block2_x": np.abs(basket1_pose[0] - block2_pose[0]) < 0.04,
+            "block2_y": np.abs(basket1_pose[1] - block2_pose[1]) < 0.06,
+            "block2_z": block2_pose[2] < 0.765,
+            "block1_x": np.abs(basket2_pose[0] - block1_pose[0]) < 0.04,
+            "block1_y": np.abs(basket2_pose[1] - block1_pose[1]) < 0.06,
+            "block1_z": block1_pose[2] < 0.765,
+            "gripper_close": self.is_left_gripper_close() or self.is_right_gripper_close(),
+            "flag": self.flag,
+            "press_cnt": self.press_cnt == 1,
+            "press_flag": self.press_flag,
+        }
+        success = all(checks.values())
         self.max_reward = max(self.max_reward, float(success))
+        self._debug_check_success(
+            success,
+            basket1_pose,
+            basket2_pose,
+            block1_pose,
+            block2_pose,
+            checks,
+            button_value,
+        )
         
         return success

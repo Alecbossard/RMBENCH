@@ -6,6 +6,9 @@ RMBench: Memory-Dependent Robotic Manipulation Benchmark with Insights into Poli
 
 # 🧑🏻‍💻 RMBench Usage
 
+For the SVLR bridge used in this branch, see
+[README_SVLR_BRIDGE_QUICKSTART.md](README_SVLR_BRIDGE_QUICKSTART.md).
+
 > This project is built upon [RoboTwin 2.0](https://github.com/robotwin-Platform/RoboTwin), and you can seamlessly transfer your policy code between the two projects.
 
 ## 1. Installation
