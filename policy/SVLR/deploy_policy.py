@@ -342,7 +342,21 @@ def _render_vlm_bgr_with_shader(env: Any, camera_key: str, shader_dir: str | Non
         camera.take_picture()
         rgba = np.asarray(camera.get_picture("Color"))
         rgb = (rgba[..., :3] * 255).clip(0, 255).astype(np.uint8)
-        return cv.cvtColor(rgb, cv.COLOR_RGB2BGR)
+        bgr = cv.cvtColor(rgb, cv.COLOR_RGB2BGR)
+        # A newly-created SAPIEN shader camera can intermittently return its
+        # zero-initialized render target even though the normal RGB-D camera is
+        # already valid.  Never forward that transient black frame to the VLM:
+        # returning None makes extract_camera_payload omit the optional VLM
+        # image, so SVLR safely uses the synchronized depth-camera RGB instead.
+        # Keep the threshold deliberately strict so legitimate dark images are
+        # not replaced merely for having low contrast.
+        if bgr.size == 0 or float(np.percentile(bgr, 99.0)) <= 5.0:
+            print(
+                f"[sim-server] rejected near-black VLM shader frame for "
+                f"{camera_key}; falling back to synchronized RGB-D color"
+            )
+            return None
+        return bgr
     except Exception as exc:
         print(f"[sim-server] could not read VLM RGB from shader '{shader_dir}': {exc}")
         return None
@@ -827,7 +841,8 @@ class SimServer:
                  home_on_reset=HOME_ON_RESET, home_controlled=None,
                  mirror_single_arm=False,
                  keep_alive_after_actions=False,
-                 vlm_camera_shader_dir: str | None = None) -> None:
+                 vlm_camera_shader_dir: str | None = None,
+                 debug_dir=".") -> None:
         self.host, self.port = host, port
         self.controlled_arm = controlled_arm
         self.action_poll_s = float(action_poll_s)
@@ -844,6 +859,9 @@ class SimServer:
         self.mirror_single_arm = bool(mirror_single_arm)
         self.keep_alive_after_actions = bool(keep_alive_after_actions)
         self.vlm_camera_shader_dir = str(vlm_camera_shader_dir or "").strip()
+        self.debug_dir = os.path.abspath(os.path.expanduser(str(debug_dir or ".")))
+        if self.save_debug_images:
+            os.makedirs(self.debug_dir, exist_ok=True)
         if self.finish_idle_s < 0.0:
             raise ValueError("finish_idle_s must be >= 0")
         self._driver_state_lock = threading.Lock()
@@ -862,9 +880,8 @@ class SimServer:
             self.min_substeps_per_action = self.max_substeps_per_action
         self.home_on_reset = bool(home_on_reset)
 
-        # HOME_CONTROLLED is the observation/start pose for the single arm
-        # controlled by SVLR. It is the pose we move to when --sim_home true
-        # and no explicit --sim_home_controlled override is provided.
+        # HOME_CONTROLLED is the physical start and perception pose for the
+        # single arm when --sim_home is enabled.
         self.home_controlled = np.asarray(
             HOME_CONTROLLED if home_controlled is None else home_controlled,
             dtype=np.float64,
@@ -1026,7 +1043,9 @@ class SimServer:
                 rgb = np.asarray(cam["rgb"])
                 if rgb.dtype != np.uint8:
                     rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-                out_path = f"svlr_bridge_{key}_{suffix}.png"
+                out_path = os.path.join(
+                    self.debug_dir, f"svlr_bridge_{key}_{suffix}.png"
+                )
                 Image.fromarray(rgb).save(out_path)
                 print(f"[sim-server] saved {out_path}")
                 saved_any = True
@@ -1180,25 +1199,24 @@ class SimServer:
             self.controlled_arm,
             mirror_single_arm=self.mirror_single_arm,
         )
-        run_for = self._execute_until_ee_reached(env, has_position_target=has_position_target)
+        run_for, action_observation = self._execute_until_ee_reached(
+            env,
+            has_position_target=has_position_target,
+        )
         with contextlib.suppress(Exception):
-            self._save_debug_camera_images(env.get_obs(), f"after{env.take_action_cnt}")
+            # _execute_until_ee_reached already acquired the synchronized fresh
+            # observation used for the bridge publish. Reuse it for debug output
+            # instead of asking SAPIEN to render the same frame a second time.
+            self._save_debug_camera_images(
+                action_observation, f"after{env.take_action_cnt}"
+            )
         print(f"[sim-server] take_action complete: {self._cmd}  (ran {run_for} substeps)")
 
         if bool(getattr(env, "eval_success", False)):
+            # The fresh post-action observation was already published by
+            # _execute_until_ee_reached; do not perform another renderer read on
+            # the terminal path before returning the validator verdict.
             self.bridge.set_done(True)
-            with contextlib.suppress(Exception):
-                self.bridge.publish(
-                    pose_for_svlr(self._cmd, self.controlled_arm),
-                    extract_camera_payload(
-                        env.get_obs(),
-                        self.camera_key,
-                        env=env,
-                        controlled_arm=self.controlled_arm,
-                        vlm_camera_shader_dir=self.vlm_camera_shader_dir,
-                    ),
-                    sim_list_entities(env),
-                )
             return
 
         # ACK the low-level SVLR command only after the sim has advanced it.
@@ -1213,13 +1231,18 @@ class SimServer:
         if self.home_on_reset:
             print(f"[sim-server] homing {self.controlled_arm} arm to {self.home_controlled}")
             base = _ARM_BASE[self.controlled_arm]
-            self._cmd[base:base + 8] = self.home_controlled   # xyz + quat + gripper
-            self._execute_until_ee_reached(env)               # move to home (consumes a few steps)
+            self._cmd[base:base + 8] = self.home_controlled
+            if self.mirror_single_arm:
+                other_arm = "left" if self.controlled_arm == "right" else "right"
+                other_base = _ARM_BASE[other_arm]
+                self._cmd[other_base:other_base + 8] = self.home_controlled
+            _run_for, pub_obs = self._execute_until_ee_reached(env)
+        else:
+            pub_obs = env.get_obs()
 
-        # Publish a FRESH post-home frame (the passed `observation` is now stale).
-        # In drive mode, the driver opens the action gate only after SVLR has
-        # acknowledged /reset_episode, so stale commands cannot cross episodes.
-        pub_obs = env.get_obs()
+        # Publish one synchronized observation only after the physical home
+        # transition has completed. The driver is queued below, so VLM and
+        # Grounded-SAM2 cannot race the home motion or read a cached pre-home cue.
         m = _endpose_from_obs(pub_obs)
         pose = pose_for_svlr(m if m is not None else self._cmd, self.controlled_arm)
         self.bridge.publish(
@@ -1232,6 +1255,10 @@ class SimServer:
                 vlm_camera_shader_dir=self.vlm_camera_shader_dir,
             ),
             sim_list_entities(env),
+        )
+        print(
+            "[sim-server] synchronized post-home perception frame published; "
+            f"take_action_cnt={getattr(env, 'take_action_cnt', None)}"
         )
 
         # If a dense home action already satisfied the task (or an explicit debug
@@ -1257,7 +1284,11 @@ class SimServer:
                 self.bridge.open_action_window()
 
     # -- execute exactly one RMBench dense action per SVLR low-level command --
-    def _execute_until_ee_reached(self, env: Any, has_position_target: bool = True) -> int:
+    def _execute_until_ee_reached(
+        self,
+        env: Any,
+        has_position_target: bool = True,
+    ) -> tuple[int, Any]:
         """Execute one SVLR low-level command as one RMBench dense action.
 
         Important RMBench/SAPIEN detail: env.take_action(..., action_type="ee")
@@ -1311,7 +1342,7 @@ class SimServer:
         else:
             print("[sim-server] one-shot gripper action complete")
 
-        return 1
+        return 1, observation
 
 
 # ===========================================================================
@@ -1354,6 +1385,48 @@ def _as_vec(v):
     return [float(x) for x in str(v).split(",")]
 
 
+def _configure_camera_shader_environment(usr_args=None) -> tuple[str, str]:
+    """Select source and VLM camera shaders before RMBench creates the scene.
+
+    SAPIEN binds a shader when each camera is created.  The default raster
+    shader can expose orange render outlines in off-screen RGB captures, while
+    the RMBench-compatible ``minimal`` shader produces clean RGB and still
+    provides the packed position texture used by the depth path.  Unless the
+    source shader is explicitly overridden, keep it aligned with the requested
+    VLM shader so RGB-D, VLM, and segmentation observe the same clean render.
+    """
+    vlm_camera_shader_dir = _cfg(
+        usr_args,
+        "sim_vlm_camera_shader_dir",
+        "SIM_VLM_CAMERA_SHADER_DIR",
+        "",
+        str,
+    ).strip()
+    source_camera_shader_dir = _cfg(
+        usr_args,
+        "sim_camera_shader_dir",
+        "RMBENCH_CAMERA_SHADER_DIR",
+        vlm_camera_shader_dir,
+        str,
+    ).strip()
+
+    for env_key, shader_dir in (
+        ("RMBENCH_CAMERA_SHADER_DIR", source_camera_shader_dir),
+        ("RMBENCH_VLM_CAMERA_SHADER_DIR", vlm_camera_shader_dir),
+    ):
+        if shader_dir:
+            os.environ[env_key] = shader_dir
+        else:
+            os.environ.pop(env_key, None)
+
+    print(
+        "[render] configured camera shaders: "
+        f"source={source_camera_shader_dir or 'default'} "
+        f"vlm={vlm_camera_shader_dir or 'same'}"
+    )
+    return source_camera_shader_dir, vlm_camera_shader_dir
+
+
 def get_model(usr_args=None):
     global _SERVER
     if _SERVER is None:
@@ -1369,17 +1442,9 @@ def get_model(usr_args=None):
                 and usr_args.get("dual_arm_embodied", False)
                 and usr_args.get("single_physical_dual_slot", False)
             )
-        vlm_camera_shader_dir = _cfg(
-            usr_args,
-            "sim_vlm_camera_shader_dir",
-            "SIM_VLM_CAMERA_SHADER_DIR",
-            "",
-            str,
-        ).strip()
-        if vlm_camera_shader_dir:
-            os.environ["RMBENCH_VLM_CAMERA_SHADER_DIR"] = vlm_camera_shader_dir
-        else:
-            os.environ.pop("RMBENCH_VLM_CAMERA_SHADER_DIR", None)
+        _source_camera_shader_dir, vlm_camera_shader_dir = (
+            _configure_camera_shader_environment(usr_args)
+        )
         _SERVER = SimServer(
             host=_cfg(usr_args, "sim_host", "SIM_HOST", "0.0.0.0", str),
             port=_cfg(usr_args, "sim_port", "SIM_PORT", 65500, int),
@@ -1409,6 +1474,13 @@ def get_model(usr_args=None):
                 _as_bool,
             ),
             vlm_camera_shader_dir=vlm_camera_shader_dir,
+            debug_dir=_cfg(
+                usr_args,
+                "sim_debug_dir",
+                "SIM_DEBUG_DIR",
+                ".",
+                str,
+            ),
         )
         _SERVER.start()
     return _SERVER

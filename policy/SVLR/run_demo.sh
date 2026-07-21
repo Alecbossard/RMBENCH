@@ -28,12 +28,22 @@ SIM_KEEP_ALIVE_AFTER_ACTIONS="${SIM_KEEP_ALIVE_AFTER_ACTIONS:-false}"
 RENDER_FREQ="${RENDER_FREQ:-30}"
 INSTRUCTION_TYPE="${INSTRUCTION_TYPE:-unseen}"
 EPISODE_NUM="${EPISODE_NUM:-1}"
+INSTANCE_ID="${RMBENCH_INSTANCE_ID:-$TASK_NAME}"
+SIM_PORT="${SIM_PORT:-65500}"
+SVLR_URL="${SVLR_URL:-http://127.0.0.1:7860}"
+RUNTIME_DIR="${RMBENCH_RUNTIME_DIR:-/tmp/svlr-rmbench/$INSTANCE_ID/rmbench}"
+SIM_DEBUG_DIR="${SIM_DEBUG_DIR:-$RUNTIME_DIR/debug_images}"
+EVAL_OUTPUT_DIR="${RMBENCH_EVAL_OUTPUT_DIR:-$RUNTIME_DIR/eval_result}"
 
-if command -v fuser >/dev/null 2>&1 && fuser -s 65500/tcp; then
-  echo "Port 65500 is already in use. Stop the previous RMBench bridge (Ctrl-C or POST /stop) before re-running." >&2
+mkdir -p "$RUNTIME_DIR/tmp" "$SIM_DEBUG_DIR" "$EVAL_OUTPUT_DIR"
+export TMPDIR="${RMBENCH_TMPDIR:-$RUNTIME_DIR/tmp}"
+
+if command -v fuser >/dev/null 2>&1 && fuser -s "${SIM_PORT}/tcp"; then
+  echo "Port ${SIM_PORT} is already in use. Stop the matching RMBench bridge before re-running." >&2
   exit 1
 fi
-rm -f svlr_bridge_*.png
+
+echo "[RMBench instance] id=$INSTANCE_ID sim_port=$SIM_PORT svlr_url=$SVLR_URL runtime=$RUNTIME_DIR"
 
 pixi run -e svlr python script/eval_svlr.py --config policy/SVLR/deploy_policy.yml --overrides \
   --task_name "${TASK_NAME}" \
@@ -44,6 +54,10 @@ pixi run -e svlr python script/eval_svlr.py --config policy/SVLR/deploy_policy.y
   --instruction_type "${INSTRUCTION_TYPE}" \
   --episode_num "${EPISODE_NUM}" \
   --global_task "${GLOBAL_TASK}" \
+  --sim_port "${SIM_PORT}" \
+  --svlr_url "${SVLR_URL}" \
+  --sim_debug_dir "${SIM_DEBUG_DIR}" \
+  --eval_output_dir "${EVAL_OUTPUT_DIR}" \
   --sim_camera_key "${SIM_CAMERA_KEY}" \
   --sim_save_debug_images "${SIM_SAVE_DEBUG_IMAGES}" \
   --sim_drive "${SIM_DRIVE}" \
