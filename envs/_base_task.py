@@ -23,6 +23,7 @@ from pathlib import Path
 import trimesh
 import imageio
 import glob
+import time
 
 
 from ._GLOBAL_CONFIGS import *
@@ -1743,7 +1744,9 @@ class Base_Task(gym.Env):
         
         elif action_type == 'ee':
 
+            svlr_plan_started = time.monotonic()
             left_result = self.robot.left_plan_path(left_arm_actions[0])
+            svlr_left_plan_seconds = time.monotonic() - svlr_plan_started
             if left_result["status"] != "Success":
                 left_n_step = 50
                 topp_left_flag = False
@@ -1761,6 +1764,12 @@ class Base_Task(gym.Env):
                 else:
                     right_n_step = right_result["position"].shape[0]
                     topp_right_flag = True
+
+            print(
+                "\n[SVLR dense-ee] "
+                f"left_plan_seconds={svlr_left_plan_seconds:.3f} "
+                f"left_status={left_result['status']} left_trajectory_steps={left_n_step}"
+            )
 
         # ========== Gripper ==========
 
@@ -1799,6 +1808,14 @@ class Base_Task(gym.Env):
             right_gripper = np.array(right_gripper)
 
         now_left_id, now_right_id = 0, 0
+        svlr_dense_render_step = 0
+        svlr_control_started = time.monotonic()
+        try:
+            svlr_dense_render_stride = max(
+                1, int(os.environ.get("SVLR_DENSE_VIEWER_RENDER_STRIDE", "25"))
+            )
+        except ValueError:
+            svlr_dense_render_stride = 25
 
         # ========== Control Loop ==========
         while now_left_id < left_n_step or (self.is_dual_arm and now_right_id < right_n_step):
@@ -1829,11 +1846,15 @@ class Base_Task(gym.Env):
 
             self.scene.step()
             self._update_render()
+            svlr_dense_render_step += 1
 
-            # SVLR/debug patch:
-            # Keep the SAPIEN viewer rendering during dense env.take_action(...)
-            # so EE motions are visible instead of appearing as a teleport.
-            if self.render_freq:
+            # Keep the viewer responsive without path-tracing/rasterizing every
+            # 250 Hz physics sample.  Scene state is still advanced and synced
+            # on every sample; only intermediate viewer presentation is paced.
+            if (
+                self.render_freq
+                and svlr_dense_render_step % svlr_dense_render_stride == 0
+            ):
                 self.viewer.render()
                 
             if self.check_success():
@@ -1846,6 +1867,12 @@ class Base_Task(gym.Env):
         self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()
+        print(
+            "[SVLR dense-ee] "
+            f"control_seconds={time.monotonic() - svlr_control_started:.3f} "
+            f"left_steps_executed={now_left_id} "
+            f"viewer_render_stride={svlr_dense_render_stride}"
+        )
 
 
     def save_camera_images(self, task_name, step_name, generate_num_id, save_dir="./camera_images"):
