@@ -8,6 +8,11 @@ RMBench: Memory-Dependent Robotic Manipulation Benchmark with Insights into Poli
 
 > This project is built upon [RoboTwin 2.0](https://github.com/robotwin-Platform/RoboTwin), and you can seamlessly transfer your policy code between the two projects.
 
+> **SVLR five-task integration:** use the reproducible Pixi setup and paired
+> launchers in [policy/SVLR/README_SVLR_BRIDGE.md](policy/SVLR/README_SVLR_BRIDGE.md).
+> Those branch-specific instructions replace the generic installation steps
+> below when running SVLR.
+
 ## 1. Installation
 First, prepare a conda environment.
 

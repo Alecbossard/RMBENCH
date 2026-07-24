@@ -32,7 +32,7 @@ numpy = "<2"
 
 [feature.main.pypi-dependencies]
 pytorch3d = { git = "https://github.com/facebookresearch/pytorch3d.git", branch = "stable" }
-nvidia-curobo = { path = "envs/curobo", editable = true }
+nvidia-curobo = { git = "https://github.com/NVlabs/curobo.git", tag = "v0.7.8" }
 torchvision = ">=0.19.1, <0.20"
 transforms3d = "==0.4.2"
 sapien = "==3.0.0b1"
@@ -87,7 +87,7 @@ no-build-isolation = ["pytorch3d", "nvidia-curobo", "flash-attn"]
 
 # source builds — resolved + built inside the solve, after torch lands
 pytorch3d     = { git = "https://github.com/facebookresearch/pytorch3d.git", branch = "stable" }
-nvidia-curobo = { path = "envs/curobo", editable = true }
+nvidia-curobo = { git = "https://github.com/NVlabs/curobo.git", tag = "v0.7.8" }
 
 # model stack (was your dependency-overrides + requirements.txt)
 transformers = "==4.57.1"
@@ -169,7 +169,7 @@ no-build-isolation = ["pytorch3d", "nvidia-curobo", "flash-attn"]
 
 # source builds — resolved + built inside the solve, after torch lands
 pytorch3d     = { git = "https://github.com/facebookresearch/pytorch3d.git", branch = "stable" }
-nvidia-curobo = { path = "envs/curobo", editable = true }
+nvidia-curobo = { git = "https://github.com/NVlabs/curobo.git", tag = "v0.7.8" }
 
 # model stack (was your dependency-overrides + requirements.txt)
 transformers = "==4.57.1"
@@ -221,7 +221,8 @@ gradio-client = ">=2.5.0, <3"
 
 [feature.svlr.tasks]
 eval = "bash script/run_eval_svlr.sh"
-setup = { depends-on = ["patch-libs", "download-assets", "download-data", "configure-embodiments", "validate-franka"] }
+download-svlr-data = "python data/_download.py --metadata-only --tasks swap_blocks put_back_block rearrange_blocks press_button cover_blocks"
+setup = { depends-on = ["patch-libs", "download-assets", "download-svlr-data", "configure-embodiments", "validate-franka"] }
 # ================= ENVIRONMENTS =================
 # Each = default feature (python) + its own feature. Independent solves.
 [environments]

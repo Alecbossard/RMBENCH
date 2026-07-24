@@ -63,7 +63,7 @@ echo "Run directory: $RUN_DIR"
 env -u CUDA_VISIBLE_DEVICES \
   PYTHONUNBUFFERED=1 \
   TMPDIR="$TMP_DIR" \
-  pixi run -e svlr python script/eval_svlr.py \
+  pixi run --locked -e svlr python script/eval_svlr.py \
     --config policy/SVLR/deploy_policy.yml \
     --overrides \
     --task_name "$TASK_NAME" \
